@@ -219,7 +219,6 @@ struct WCboot // Boot status struct for WunderClock
 
 struct WCboot bBlock;               // Boot status for WunderClock
 struct programControl pControl[10]; // Array to hold the program control structures for each program mode
-struct dataControl dControl;        // Data control block for WunderClock
 struct WCcontrol cBlock;            // Control block for WunderClock
 
 /*****************************************************************************
@@ -450,33 +449,31 @@ void setupPControl()
 bool writeBlocks()
 {
   // Add code to update the CBlock, DBlock, and BBlock structures in FRAM
-  fram.write(dControl.cBlockADDR, (u8_t *)&cBlock, sizeof(cBlock));       // Write the CBlock structure to FRAM
-  fram.write(dControl.bBlockADDR, (u8_t *)&bBlock, sizeof(bBlock));       // Write the BBlock structure to FRAM
-  fram.write(dControl.dControlADDR, (u8_t *)&dControl, sizeof(dControl)); // Write the dControl structure to FRAM
-                                                                          // fram.write(dControl.pControlADDR, (u8_t *)&pControl, sizeof(pControl)); // Write the pControl structure to FRAM
+  fram.write(cBlockADDR, (u8_t *)&cBlock, sizeof(cBlock));       // Write the CBlock structure to FRAM
+  fram.write(bBlockADDR, (u8_t *)&bBlock, sizeof(bBlock)); // Write the BBlock structure to FRAM
+
 
   return true; // Return true if update is successful
 } // end writeBlocks()
 
 bool bBlockRead()
 {
-  fram.read(dControl.bBlockADDR, (u8_t *)&bBlock, sizeof(bBlock)); // Read the BBlock structure from FRAM
+  fram.read(bBlockADDR, (u8_t *)&bBlock, sizeof(bBlock)); // Read the BBlock structure from FRAM
   return true;
 } // end bBlockRead()
 
 bool bBlockWrite()
 {
-  fram.write(dControl.bBlockADDR, (u8_t *)&bBlock, sizeof(bBlock)); // Write the BBlock structure to FRAM
+  fram.write(bBlockADDR, (u8_t *)&bBlock, sizeof(bBlock)); // Write the BBlock structure to FRAM
   return true;
 } // end bBlockWrite()
 
 bool readBlocks()
 {
   // Add code to update the CBlock, DBlock, and BBlock structures in FRAM
-  fram.read(dControl.cBlockADDR, (u8_t *)&cBlock, sizeof(cBlock));       // Read the CBlock structure from FRAM
-  fram.read(dControl.bBlockADDR, (u8_t *)&bBlock, sizeof(bBlock));       // Read the BBlock structure from FRAM
-  fram.read(dControl.dControlADDR, (u8_t *)&dControl, sizeof(dControl)); // Read the dControl structure from FRAM
-                                                                         // fram.read(dControl.pControlADDR, (u8_t *)&pControl, sizeof(pControl)); // Read the pControl structure from FRAM
+  fram.read(cBlockADDR, (u8_t *)&cBlock, sizeof(cBlock));       // Read the CBlock structure from FRAM
+  fram.read(bBlockADDR, (u8_t *)&bBlock, sizeof(bBlock)); // Read the BBlock structure from FRAM
+
 
   return true; // Return true if update is successful
 } // end readBlocks()
