@@ -92,6 +92,7 @@
 #include <Arduino.h>
 #include <Wire.h>                    // Core library - I2C
 #include <LittleFS.h>                // Core library - File system
+#include <Preferences.h>             // Core library - NVS Preferences
 #include <RTClib.h>                  // https://github.com/adafruit/RTClib.git
 #include <ezTime.h>                  // https://github.com/ropg/ezTime.git
 #include <Adafruit_BME280.h>         // https://github.com/adafruit/Adafruit_BME280_Library.git
@@ -212,7 +213,7 @@ struct WCboot // Boot status struct for WunderClock
   double permPressureLo = 0;    // Permanent pressure record
   double permServiceTempHi = 0; // Permanent service temperature record
   double permServiceTempLo = 0; // Permanent service temperature record
-  u32_t lastBlockADDR = 0;      // Last time location was written to FRAM
+  u32_t lastBlockADDR = 0x1000; // Last time location was written to FRAM
   u32_t bootCount = 0;          // Number of boots
   u8_t bootMode = 0;            // 0 = factory reset, 1 = regular boot, 2 = settings
 };
@@ -228,6 +229,7 @@ struct WCcontrol cBlock;            // Control block for WunderClock
 Adafruit_FRAM_I2C fram = Adafruit_FRAM_I2C();  // Create the FRAM object
 GFXcanvas16 canvas(MatrixWidth, MatrixHeight); // Create a canvas or copy for the display
 RTC_DS3231 RTClock;                            // Create a RTC object I2C
+Preferences pref;                              // Preferences object
 
 // Protomatter matrix create
 #ifdef SWAP
@@ -256,8 +258,8 @@ u16_t *videoBufferC = canvas.getBuffer();
 void setup()
 {
   // put your setup code here, to run once:
-  if (!blindSetup())
-  { // this should hang in funtion but if not hang here
+  if (!blindSetup()) // setup rtc, display, FRAM and littleFS file system
+  {                  // this should hang in funtion but if not hang here
     matrixErrorPrint("Blind setup failed");
     while (1)
       ;
@@ -272,15 +274,52 @@ void setup()
     ; // Hang after first run to ensure blocks are written
 #endif
 
-  bBlockRead(); // Read the boot and control blocks from FRAM
+  bBlockRead(); // Read the boot block from FRAM
 
   if (bBlock.bootMode == 0)
   {
     // Perform setup for boot mode 0
+    matrixErrorPrint("Factory reset in progress");
 
     bBlock.bootMode = 1; // Set to regular boot after initial setup
-    writeBlocks();       // Save the updated boot mode to FRAM
-  }
+
+    if (!pref.begin("eeprom", false)) // Start Preferences with namespace "eeprom" and readOnly = false
+    {
+      debugln("factory reset of  NVS failed");
+      matrixErrorPrint("NVS factory reset failed.");
+      while (1) // no need to recover from NVS failure as we can not save settings without NVS, so hang forever.
+        ;
+    }
+    else
+    {
+      debugln("NVS factory reset successful");
+    }
+
+    if (!pref.clear())
+    {
+      debugln("Failed to clear all preferences in NVS");
+      matrixErrorPrint("Failed to clear NVS");
+      while (1)
+        ;
+    } // Clear all preferences in NVS
+    else
+    {
+      debugln("Cleared all preferences in NVS successfully");
+    }
+
+    pref.end(); // Close Preferences to ensure data is written
+
+    // wm.resetSettings();
+    //  myTZ.clearCache();   // Clear timezone cache
+
+    // Add any other settings resets here as needed
+    writeBlocks(); // Update blocks to save factory reset status
+
+    delay(3000); // Delay to ensure cache is cleared before writing
+
+    esp_restart(); // Restart the ESP to complete factory reset
+
+  } // end if (bBlock.bootMode == 0) factory reset
 
   // so gnss, nts, and other services can be initialized here if needed
 
@@ -449,9 +488,8 @@ void setupPControl()
 bool writeBlocks()
 {
   // Add code to update the CBlock, DBlock, and BBlock structures in FRAM
-  fram.write(cBlockADDR, (u8_t *)&cBlock, sizeof(cBlock));       // Write the CBlock structure to FRAM
+  fram.write(cBlockADDR, (u8_t *)&cBlock, sizeof(cBlock)); // Write the CBlock structure to FRAM
   fram.write(bBlockADDR, (u8_t *)&bBlock, sizeof(bBlock)); // Write the BBlock structure to FRAM
-
 
   return true; // Return true if update is successful
 } // end writeBlocks()
@@ -471,9 +509,8 @@ bool bBlockWrite()
 bool readBlocks()
 {
   // Add code to update the CBlock, DBlock, and BBlock structures in FRAM
-  fram.read(cBlockADDR, (u8_t *)&cBlock, sizeof(cBlock));       // Read the CBlock structure from FRAM
+  fram.read(cBlockADDR, (u8_t *)&cBlock, sizeof(cBlock)); // Read the CBlock structure from FRAM
   fram.read(bBlockADDR, (u8_t *)&bBlock, sizeof(bBlock)); // Read the BBlock structure from FRAM
-
 
   return true; // Return true if update is successful
 } // end readBlocks()
