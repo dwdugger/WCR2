@@ -101,6 +101,8 @@
 #include <SparkFun_u-blox_GNSS_v3.h> // https://github.com/sparkfun/SparkFun_u-blox_GNSS_v3.git
 #include <Adafruit_Protomatter.h>    // https://github.com/adafruit/Adafruit_Protomatter.git
 #include <WiFiManager.h>             // https://github.com/tzapu/WiFiManager.git
+#define IR_RECEIVE_PIN A4            // ****Pin for IR receiver. Required for TinyIRReceiver.hpp below
+#include <TinyIRReceiver.hpp>        // https://github.com/Arduino-IRremote/Arduino-IRremote.git
 
 #include "rgbColors.h"       // Color definitions
 #include "ir.h"              // IR remote control handling
@@ -117,6 +119,7 @@ void matrixErrorPrint(const char *text);
 bool setupFRAM(void);
 bool setupDisplayMatrix(void);
 bool setupRTC(void);
+bool setupGNSS(void);
 bool writeBlocks(void);
 bool readBlocks(void);
 void setupPControl(void);
@@ -142,6 +145,8 @@ bool SwapPallet = false; // Swap the color palette for the video tests
 u32_t ESPSketchSize = 0; // Size of the sketch in bytes, used for calculating free space for OTA updates
 
 DateTime NOW;
+DateTime gnssNOW;
+
 u8_t pControlSubProgramTotal[10] = {0, 0, 0, 0, 2, 0, 0, 0, 0, 0}; // Array to hold the total number of sub programs
                                                                    // other then default for each program mode
 
@@ -151,6 +156,9 @@ u32_t bBlockADDR = 0x800;      // addr for BBlock
 u32_t dControlADDR = 0xA00;    // addr for dControl
 u32_t cBlockADDR = 0xC00;      // addr for CBlock
 u32_t firstBlockADDR = 0x1000; // addr for captured data block
+
+bool gnssAlive = false;
+bool gnssCurrent = false;
 
 /***************************************************************************
 *******************************  STRUCTS  **********************************
@@ -218,6 +226,21 @@ struct WCboot // Boot status struct for WunderClock
   u8_t bootMode = 0;            // 0 = factory reset, 1 = regular boot, 2 = settings
 };
 
+struct gnssData
+{
+  double latitude = 0;  // Latitude in degrees
+  double longitude = 0; // Longitude in degrees
+  double elevation = 0; // Elevation in meters
+  u8_t SIV = 0;         // Satellites in view
+  u16_t year = 0;       // GNSS year
+  u8_t month = 0;       // GNSS month
+  u8_t day = 0;         // GNSS day
+  u8_t hour = 0;        // GNSS hour
+  u8_t minute = 0;      // GNSS minute
+  u8_t second = 0;      // GNSS second
+};
+
+struct gnssData gBlock;             // GNSS data block
 struct WCboot bBlock;               // Boot status for WunderClock
 struct programControl pControl[10]; // Array to hold the program control structures for each program mode
 struct WCcontrol cBlock;            // Control block for WunderClock
@@ -230,6 +253,7 @@ Adafruit_FRAM_I2C fram = Adafruit_FRAM_I2C();  // Create the FRAM object
 GFXcanvas16 canvas(MatrixWidth, MatrixHeight); // Create a canvas or copy for the display
 RTC_DS3231 RTClock;                            // Create a RTC object I2C
 Preferences pref;                              // Preferences object
+SFE_UBLOX_GNSS gnss;                           // The gnss object
 
 // Protomatter matrix create
 #ifdef SWAP
@@ -321,9 +345,37 @@ void setup()
 
   } // end if (bBlock.bootMode == 0) factory reset
 
-  // so gnss, nts, and other services can be initialized here if needed
+  // we have now handled the factory reset and initial setup, proceed with other initializations
+  // time to read settings from FRAM and initialize peripherals accordingly
+  readBlocks(); // Read the configuration blocks from FRAM
 
-  // im gona set up IR before the check to see if a setup is needed
+  if (cBlock.irActive)
+  {
+    initPCIInterruptForTinyReceiver(); // Start the PCI interrupt for the IR receiver using IR_RECIVE_PIN
+  }
+
+  // check to see if setup menu is needed
+  if (bBlock.bootMode == 2)
+  {
+    // Perform setup for boot mode 2 (setup menu)
+    cBlock.programMode = 0;
+    return;
+  }
+
+  // gnss, nts, and other services can be initialized here if needed
+
+  if (cBlock.gnssActive)
+  {
+    if (setupGNSS()) // Initialize GNSS if active
+    {
+      gnssAlive = true;
+    }
+    if (gnssAlive)
+    {
+
+      gnssCurrent = true;
+    }
+  }
 
 } // End setup()
 
@@ -514,3 +566,87 @@ bool readBlocks()
 
   return true; // Return true if update is successful
 } // end readBlocks()
+
+bool setupGNSS()
+{
+  // Add code to initialize the GNSS module if active
+  debugln("GNSS setup");
+
+  // Initialize GNSS
+  if (gnss.begin() == false)
+  {
+    debugln("GNSS not detected at default I2C address. Please check wiring.");
+    return false;
+  }
+  debugln("GNSS detected!");
+
+  // Set GNSS configuration settings
+  gnss.setI2COutput(COM_TYPE_UBX); // Set the GNSS to output UBX only (turn off NMEA noise)
+  gnss.setNavigationFrequency(1);  // Set output to 1 Hz
+
+  return true; // Return true if setup is successful
+} // end setupGNSS()
+
+bool readGNSS()
+{
+  // Read GNSS data
+  u32_t end = millis() + 30000;
+
+  while (millis() < end)
+  {
+    gnss.checkUblox(); // See if new data is available. Process bytes as they come in.
+
+    if (gnss.getLatitude() && gnss.getLongitude() && gnss.getAltitude() && gnss.getDateValid() && gnss.getTimeValid() && (gnss.getSIV() > 0))
+    {
+      gBlock.latitude = gnss.getLatitude() / 10000000.0;   // Convert to Degrees
+      gBlock.longitude = gnss.getLongitude() / 10000000.0; // Convert to Degrees
+      gBlock.elevation = gnss.getAltitudeMSL() / 1000.0;   // Convert to Meters above mean sea level
+      gBlock.SIV = gnss.getSIV();                          // Number of satellites in view
+      cBlock.latitude = gBlock.latitude;
+      cBlock.longitude = gBlock.longitude;
+      cBlock.elevation = gBlock.elevation;
+      gBlock.year = gnss.getYear();
+      gBlock.month = gnss.getMonth();
+      gBlock.day = gnss.getDay();
+      gBlock.hour = gnss.getHour();
+      gBlock.minute = gnss.getMinute();
+      gBlock.second = gnss.getSecond();
+      gnssNOW = DateTime(gBlock.year, gBlock.month, gBlock.day, gBlock.hour, gBlock.minute, gBlock.second);
+      
+      debugln("gnss date & time valid");
+
+      debug("GNSS Latitude: ");
+      debugln(gBlock.latitude);
+      debug("GNSS Longitude: ");
+      debugln(gBlock.longitude);
+      debug("GNSS Elevation: ");
+      debugln(gBlock.elevation);
+      debug("SIV: ");
+      debugln(gBlock.SIV);
+      debug("GNSS Date: ");
+      debug(gBlock.year);
+      debug("-");
+      debug(gBlock.month);
+      debug("-");
+      debugln(gBlock.day);
+      debug("GNSS Time: ");
+      debug(gBlock.hour);
+      debug(":");
+      debug(gBlock.minute);
+      debug(":");
+      debugln(gBlock.second);
+
+     /* if (cBlock.rtcActive && statusColdSetupRTC && cBlock.gnssActive && statusColdSetupGNSS)
+      {
+        RTClock.adjust(gnssNow); // Set RTC time from GNSS
+        debugln("RTC time updated from GNSS");
+        NOW = RTClock.now();
+        newTimeGNSS = NOW;
+      }
+     */
+      return true; // Return true if read is successful
+    }
+  }
+  debugln("GNSS read failed after timeout");
+  return false; // Return false if read failed after timeout
+} // end readGNSSData()
