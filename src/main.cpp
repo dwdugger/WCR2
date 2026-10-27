@@ -103,6 +103,12 @@
 #include <WiFiManager.h>             // https://github.com/tzapu/WiFiManager.git
 #define IR_RECEIVE_PIN A4            // ****Pin for IR receiver. Required for TinyIRReceiver.hpp below
 #include <TinyIRReceiver.hpp>        // https://github.com/Arduino-IRremote/Arduino-IRremote.git
+#include <TaskScheduler.h>           // https://github.com/arkhipenko/TaskScheduler.git
+#include <ArduinoJson.h>             // https://github.com/bblanchon/ArduinoJson.git
+#include <ElegantOTA.h>              // https://github.com/ayushsharma82/ElegantOTA.git
+
+#include <WiFiClientSecure.h>       // Core library - Secure WiFi client for HTTPS requests
+#include <HTTPClient.h>             // Core library - HTTP client
 
 #include "rgbColors.h"       // Color definitions
 #include "ir.h"              // IR remote control handling
@@ -120,11 +126,17 @@ bool setupFRAM(void);
 bool setupDisplayMatrix(void);
 bool setupRTC(void);
 bool setupGNSS(void);
+bool setupOTA(void);
 bool writeBlocks(void);
 bool readBlocks(void);
 void setupPControl(void);
 bool bBlockRead(void);
 bool bBlockWrite(void);
+bool setupBME280(void);
+bool setupWiFi(void);
+bool setupTaskScheduler(void);
+bool readGNSS(void);
+bool readGoogleTZAPI(void);
 
 /*****************************************************************************
 ******************************  GLOBALS  *************************************
@@ -159,7 +171,10 @@ u32_t firstBlockADDR = 0x1000; // addr for captured data block
 
 bool gnssAlive = false;
 bool gnssCurrent = false;
-
+time_t gnssLastUpdate = 0; // Timestamp of the last GNSS update
+bool wifiAlive = false;
+  bool googleTZAPIAlive = false;                              
+  bool googleTZAPICurrent = false;                               
 /***************************************************************************
 *******************************  STRUCTS  **********************************
 ***************************************************************************/
@@ -254,6 +269,14 @@ GFXcanvas16 canvas(MatrixWidth, MatrixHeight); // Create a canvas or copy for th
 RTC_DS3231 RTClock;                            // Create a RTC object I2C
 Preferences pref;                              // Preferences object
 SFE_UBLOX_GNSS gnss;                           // The gnss object
+Timezone myTZ;                                 // Timezone object
+Adafruit_BME280 bme;                           // I2C
+WiFiManager wm;                                // WiFiManager object
+Scheduler taskSchd;                             // Create a TaskScheduler object
+JsonDocument doc;                              // JSON document for parsing
+AsyncWebServer server(80); // Create an AsyncWebServer object on port 80
+  WiFiClientSecure client;
+
 
 // Protomatter matrix create
 #ifdef SWAP
@@ -333,7 +356,7 @@ void setup()
 
     pref.end(); // Close Preferences to ensure data is written
 
-    // wm.resetSettings();
+    wm.resetSettings();  // Reset WiFiManager
     //  myTZ.clearCache();   // Clear timezone cache
 
     // Add any other settings resets here as needed
@@ -372,10 +395,28 @@ void setup()
     }
     if (gnssAlive)
     {
-
-      gnssCurrent = true;
+      if (readGNSS())
+      {
+        gnssCurrent = true;
+      }
     }
   }
+
+  if (cBlock.wifiActive)
+  {
+    if (setupWiFi())
+    {
+      wifiAlive = true;
+    }
+  }
+
+  if (WiFi.status() == WL_CONNECTED && cBlock.googleTZAPIActive)
+{
+  if (readGoogleTZAPI()) // Initialize Google Timezone API if active
+  {
+    googleTZAPIAlive = true;
+  }
+}
 
 } // End setup()
 
@@ -612,7 +653,7 @@ bool readGNSS()
       gBlock.minute = gnss.getMinute();
       gBlock.second = gnss.getSecond();
       gnssNOW = DateTime(gBlock.year, gBlock.month, gBlock.day, gBlock.hour, gBlock.minute, gBlock.second);
-      
+
       debugln("gnss date & time valid");
 
       debug("GNSS Latitude: ");
@@ -636,17 +677,120 @@ bool readGNSS()
       debug(":");
       debugln(gBlock.second);
 
-     /* if (cBlock.rtcActive && statusColdSetupRTC && cBlock.gnssActive && statusColdSetupGNSS)
-      {
-        RTClock.adjust(gnssNow); // Set RTC time from GNSS
-        debugln("RTC time updated from GNSS");
-        NOW = RTClock.now();
-        newTimeGNSS = NOW;
-      }
-     */
+      /* if (cBlock.rtcActive && statusColdSetupRTC && cBlock.gnssActive && statusColdSetupGNSS)
+       {
+         RTClock.adjust(gnssNow); // Set RTC time from GNSS
+         debugln("RTC time updated from GNSS");
+         NOW = RTClock.now();
+         newTimeGNSS = NOW;
+       }
+      */
       return true; // Return true if read is successful
     }
   }
   debugln("GNSS read failed after timeout");
   return false; // Return false if read failed after timeout
-} // end readGNSSData()
+} // end readGNSS()
+
+bool setupWiFi()
+{
+  // reset settings - wipe stored credentials for testing
+  // these are stored by the esp library
+#ifdef DEBUG2
+  wm.resetSettings();
+#endif
+#ifdef DEBUG1
+  wm.setDebugOutput(true);
+#else
+  wm.setDebugOutput(false);
+#endif
+
+  wm.setConfigPortalTimeout(180);
+  bool res;
+  // res = wm.autoConnect(); // auto generated AP name from chipid
+  // res = wm.autoConnect("AutoConnectAP"); // anonymous ap
+  res = wm.autoConnect("WunderClock", "password"); // password protected ap
+  if (!res)
+  {
+    debugln("Failed to connect to WiFi and hit timeout");
+    return false;
+  }
+  return true; // Return true if WiFi setup is successful
+} // end setupWiFi()
+
+bool readGoogleTZAPI()
+{
+  // Implement the logic to read Google Timezone API
+  // Return true if successful, false otherwise
+
+  // Implement the actual API call here
+  // If successful, set googleTZAPICurrent to true
+
+  String URL = "https://maps.googleapis.com/maps/api/timezone/json?location=" + String(cBlock.latitude) + "," + String(cBlock.longitude) + "&timestamp=" + String(NOW.unixtime()) + "&key=" + KeyGoogleMapsAPI; // Google Maps API URL
+  debugln(URL);
+  
+
+  WiFiClientSecure client;
+  HTTPClient http; // Create an HTTP client object
+
+  http.useHTTP10(true); // Use HTTP/1.0 for the request
+  client.setInsecure(); // Disable SSL certificate verification for testing purposes
+
+  http.setTimeout(10000); // Set the timeout for the HTTP request to 10 seconds
+
+  http.begin(client, URL); // Start the HTTP client with the URL
+
+  int httpCode = http.GET(); // Send the HTTP GET request and get the response code
+
+  if (WiFi.status() == WL_CONNECTED)
+  {
+    debugln("WiFi connectedTZAPI");
+    debug("HTTP code: ");
+    debugln(httpCode); // Print the HTTP response code to the serial monitor
+  }
+  else
+  {
+    debugln("Must set clock manually");
+    return false;
+  }
+
+  // Parse JSON object
+  DeserializationError error = deserializeJson(doc, http.getStream()); // Read the response and parse it as a JSON object
+  if (error)
+  {
+    debug(F("deserializeJson() failed: "));
+    debugln(error.f_str());
+    client.stop(); // Stop the HTTP client
+    http.end();    // End the HTTP client
+    return false;
+  }
+
+  debugln("JSON parsed successfully");
+  // Print the JSON object to the serial monitor
+  cBlock.dstOffset = doc["dstOffset"].as<int32_t>(); // Get the dstOffset value from the JSON object
+  cBlock.rawOffset = doc["rawOffset"].as<int32_t>(); // Get the rawOffset value from the JSON object
+  String timeZoneId = doc["timeZoneId"].as<String>();       // Get the timeZoneId value from the JSON object
+  String timeZoneName = doc["timeZoneName"].as<String>();   // Get the timeZoneName value from the JSON object
+
+  timeZoneId.toCharArray(cBlock.timeZoneId, 17); // Convert the time
+
+  debugln("Response:");
+  debugln(doc["rawOffset"].as<int32_t>()); // Print the rawOffset value to the serial monitor
+  debugln(doc["dstOffset"].as<int32_t>());
+  debugln(doc["timeZoneId"].as<String>());
+  debugln(doc["timeZoneName"].as<String>());
+  debugln("Timezone ID: " + String(cBlock.timeZoneId));
+
+  client.stop(); // Stop the HTTP client
+  http.end();    // End the HTTP client
+
+  return true;
+
+} // end readGoogleTZAPI()
+
+bool setupOTA(void)
+{
+  // Implement OTA setup logic here
+  // Return true if successful, false otherwise
+  return true;
+}
