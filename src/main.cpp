@@ -36,7 +36,7 @@
 *************************    DEBUG/COMPILER DEFINES    ***********************
 *****************************************************************************/
 
-#define FIRST_RUN // This define is really only for first compile. User will need to comment out and recompile to run the clock.
+// #define FIRST_RUN // This define is really only for first compile. User will need to comment out and recompile to run the clock.
 
 #define TESTING // Define for testing
 
@@ -107,8 +107,8 @@
 #include <ArduinoJson.h>             // https://github.com/bblanchon/ArduinoJson.git
 #include <ElegantOTA.h>              // https://github.com/ayushsharma82/ElegantOTA.git
 
-#include <WiFiClientSecure.h>       // Core library - Secure WiFi client for HTTPS requests
-#include <HTTPClient.h>             // Core library - HTTP client
+#include <WiFiClientSecure.h> // Core library - Secure WiFi client for HTTPS requests
+#include <HTTPClient.h>       // Core library - HTTP client
 
 #include "rgbColors.h"       // Color definitions
 #include "ir.h"              // IR remote control handling
@@ -127,6 +127,7 @@ bool setupDisplayMatrix(void);
 bool setupRTC(void);
 bool setupGNSS(void);
 bool setupOTA(void);
+bool setupNTP(void);
 bool writeBlocks(void);
 bool readBlocks(void);
 void setupPControl(void);
@@ -137,6 +138,8 @@ bool setupWiFi(void);
 bool setupTaskScheduler(void);
 bool readGNSS(void);
 bool readGoogleTZAPI(void);
+void setupColors(float factor);               // Function to adjust color brightness
+u16_t RGB24To565(u8_t *tmpRGB, float factor); // Function to convert 24-bit RGB to 16-bit RGB565 with brightness factor
 
 /*****************************************************************************
 ******************************  GLOBALS  *************************************
@@ -158,6 +161,7 @@ u32_t ESPSketchSize = 0; // Size of the sketch in bytes, used for calculating fr
 
 DateTime NOW;
 DateTime gnssNOW;
+DateTime ntpNOW;
 
 u8_t pControlSubProgramTotal[10] = {0, 0, 0, 0, 2, 0, 0, 0, 0, 0}; // Array to hold the total number of sub programs
                                                                    // other then default for each program mode
@@ -169,12 +173,14 @@ u32_t dControlADDR = 0xA00;    // addr for dControl
 u32_t cBlockADDR = 0xC00;      // addr for CBlock
 u32_t firstBlockADDR = 0x1000; // addr for captured data block
 
-bool gnssAlive = false;
-bool gnssCurrent = false;
-time_t gnssLastUpdate = 0; // Timestamp of the last GNSS update
 bool wifiAlive = false;
-  bool googleTZAPIAlive = false;                              
-  bool googleTZAPICurrent = false;                               
+time_t wifiLastUpdate = 0; // Timestamp of the last WiFi update
+bool ntpAlive = false;
+time_t ntpLastUpdate = 0; // Timestamp of the last NTP update
+bool googleTZAPIAlive = false;
+bool googleTZAPICurrent = false;
+time_t googleTZAPILastUpdate = 0; // Timestamp of the last Google TZ API update
+
 /***************************************************************************
 *******************************  STRUCTS  **********************************
 ***************************************************************************/
@@ -253,6 +259,9 @@ struct gnssData
   u8_t hour = 0;        // GNSS hour
   u8_t minute = 0;      // GNSS minute
   u8_t second = 0;      // GNSS second
+  bool gnssAlive = false;
+  bool gnssCurrent = false;
+  time_t gnssLastUpdate = 0; // Timestamp of the last GNSS update
 };
 
 struct gnssData gBlock;             // GNSS data block
@@ -272,11 +281,10 @@ SFE_UBLOX_GNSS gnss;                           // The gnss object
 Timezone myTZ;                                 // Timezone object
 Adafruit_BME280 bme;                           // I2C
 WiFiManager wm;                                // WiFiManager object
-Scheduler taskSchd;                             // Create a TaskScheduler object
+Scheduler taskSchd;                            // Create a TaskScheduler object
 JsonDocument doc;                              // JSON document for parsing
-AsyncWebServer server(80); // Create an AsyncWebServer object on port 80
-  WiFiClientSecure client;
-
+AsyncWebServer server(80);                     // Create an AsyncWebServer object on port 80
+WiFiClientSecure client;
 
 // Protomatter matrix create
 #ifdef SWAP
@@ -304,6 +312,22 @@ u16_t *videoBufferC = canvas.getBuffer();
 
 void setup()
 {
+#ifdef DEBUG1
+  // Initialize Serial port
+  Serial.begin(115200);
+  pinMode(LED_BUILTIN, OUTPUT);
+  delay(2000); // comment out, delay to allow time for serial to start
+  while (!Serial)
+  {
+    digitalWrite(LED_BUILTIN, 1); // Blink while waiting for Serial
+    delay(100);
+    digitalWrite(LED_BUILTIN, 0);
+  }
+  digitalWrite(LED_BUILTIN, 0);
+
+  debugln("\nSerial is ready");
+#endif
+
   // put your setup code here, to run once:
   if (!blindSetup()) // setup rtc, display, FRAM and littleFS file system
   {                  // this should hang in funtion but if not hang here
@@ -311,12 +335,13 @@ void setup()
     while (1)
       ;
   }
-
+  debugln("Blind setup complete");
   setupPControl();
 
 #ifdef FIRST_RUN
   writeBlocks();
   matrixErrorPrint("First run: wrote blocks");
+  debugln("First run complete");
   while (1)
     ; // Hang after first run to ensure blocks are written
 #endif
@@ -327,6 +352,7 @@ void setup()
   {
     // Perform setup for boot mode 0
     matrixErrorPrint("Factory reset in progress");
+    debugln("Performing factory reset");
 
     bBlock.bootMode = 1; // Set to regular boot after initial setup
 
@@ -356,7 +382,7 @@ void setup()
 
     pref.end(); // Close Preferences to ensure data is written
 
-    wm.resetSettings();  // Reset WiFiManager
+    wm.resetSettings(); // Reset WiFiManager
     //  myTZ.clearCache();   // Clear timezone cache
 
     // Add any other settings resets here as needed
@@ -364,7 +390,10 @@ void setup()
 
     delay(3000); // Delay to ensure cache is cleared before writing
 
-    esp_restart(); // Restart the ESP to complete factory reset
+    // esp_restart(); // Restart the ESP to complete factory reset
+
+    esp_sleep_enable_timer_wakeup(1); // Wake up after 1 microsecond
+    esp_deep_sleep_start();           // Enter deep sleep to complete factory reset
 
   } // end if (bBlock.bootMode == 0) factory reset
 
@@ -389,15 +418,17 @@ void setup()
 
   if (cBlock.gnssActive)
   {
+    debugln("Initializing GNSS");
     if (setupGNSS()) // Initialize GNSS if active
     {
-      gnssAlive = true;
+      debugln("GNSS setup successful");
+      gBlock.gnssAlive = true;
     }
-    if (gnssAlive)
+    if (gBlock.gnssAlive)
     {
       if (readGNSS())
       {
-        gnssCurrent = true;
+        gBlock.gnssCurrent = true;
       }
     }
   }
@@ -411,18 +442,61 @@ void setup()
   }
 
   if (WiFi.status() == WL_CONNECTED && cBlock.googleTZAPIActive)
-{
-  if (readGoogleTZAPI()) // Initialize Google Timezone API if active
   {
-    googleTZAPIAlive = true;
+    if (readGoogleTZAPI()) // Initialize Google Timezone API if active
+    {
+      googleTZAPIAlive = true;
+    }
   }
-}
+
+  if (WiFi.status() == WL_CONNECTED && cBlock.ntpActive)
+  {
+    if (setupNTP())
+    {
+      ntpAlive = true;
+    }
+  }
+
+  if (WiFi.status() == WL_CONNECTED && googleTZAPIAlive && ntpAlive)
+  {
+    // set up local TZ
+    if (myTZ.setLocation(cBlock.timeZoneId))
+    {
+      debugln("Local timezone set successfully");
+      myTZ.setDefault();
+    }
+    else
+    {
+      debugln("Failed to set local timezone");
+    }
+  }
+
+  if (WiFi.status() == WL_CONNECTED && googleTZAPIAlive && gBlock.gnssAlive)
+  {
+    readGNSS(); // Read the latest GNSS data before setting the time
+
+    if (gnss.getDateValid() && gnss.getTimeValid())
+    {
+      // Set the local time based on GNSS date and time
+      UTC.setTime(gnss.getHour(), gnss.getMinute(), gnss.getSecond(), gnss.getDay(), gnss.getMonth(), gnss.getYear());
+      RTClock.adjust(UTC.now());
+    }
+  }
 
 } // End setup()
 
 void loop()
 {
   // put your main code here, to run repeatedly:
+  matrix.fillScreen(0);
+  matrix.setCursor(0, 16); // Move cursor to the first line for UTC time
+  matrix.print(UTC.dateTime(ISO8601).c_str());
+  matrix.setCursor(0, 32); // Move cursor to next line for additional info
+  matrix.print(myTZ.dateTime(ISO8601).c_str());
+  matrix.setCursor(0, 48); // Move cursor to next line for additional info
+  
+  // matrix.print("Loop running");
+  matrix.show();
 }
 
 /*****************************************************************************
@@ -494,7 +568,14 @@ void matrixErrorPrint(const char *text)
   matrix.setRotation(0);
   matrix.setTextColor(WHITE, BLACK);
   matrix.setCursor(2, 16);
-  matrix.print(printf("Error: %s", text));
+  matrix.print(text);
+  // debugln(text);
+  // char buffer[64];
+  // sprintf(buffer, "%s /n", text);
+  // matrix.print(buffer);
+  // matrix.print(printf("Error: "));
+  // matrix.print("Error: ");
+
   matrix.show();
 } // End matrixErrorPrint()
 
@@ -542,7 +623,7 @@ bool setupDisplayMatrix()
   debugln("Protomatter begin successful");
 
   // setupColors(CBlock.MatrixBrightness / 255.0); // Set up the colors for the matrix
-  // setupColors(cBlock.matrixBrightness / 255.0); // Set up the colors for the matrix
+  setupColors(cBlock.matrixBrightness / 255.0); // Set up the colors for the matrix
 
   matrix.setFont(); // Use built-in font
   matrix.fillScreen(0);
@@ -653,6 +734,7 @@ bool readGNSS()
       gBlock.minute = gnss.getMinute();
       gBlock.second = gnss.getSecond();
       gnssNOW = DateTime(gBlock.year, gBlock.month, gBlock.day, gBlock.hour, gBlock.minute, gBlock.second);
+      gBlock.gnssLastUpdate = gnssNOW.unixtime();
 
       debugln("gnss date & time valid");
 
@@ -676,15 +758,7 @@ bool readGNSS()
       debug(gBlock.minute);
       debug(":");
       debugln(gBlock.second);
-
-      /* if (cBlock.rtcActive && statusColdSetupRTC && cBlock.gnssActive && statusColdSetupGNSS)
-       {
-         RTClock.adjust(gnssNow); // Set RTC time from GNSS
-         debugln("RTC time updated from GNSS");
-         NOW = RTClock.now();
-         newTimeGNSS = NOW;
-       }
-      */
+      
       return true; // Return true if read is successful
     }
   }
@@ -728,7 +802,6 @@ bool readGoogleTZAPI()
 
   String URL = "https://maps.googleapis.com/maps/api/timezone/json?location=" + String(cBlock.latitude) + "," + String(cBlock.longitude) + "&timestamp=" + String(NOW.unixtime()) + "&key=" + KeyGoogleMapsAPI; // Google Maps API URL
   debugln(URL);
-  
 
   WiFiClientSecure client;
   HTTPClient http; // Create an HTTP client object
@@ -767,10 +840,10 @@ bool readGoogleTZAPI()
 
   debugln("JSON parsed successfully");
   // Print the JSON object to the serial monitor
-  cBlock.dstOffset = doc["dstOffset"].as<int32_t>(); // Get the dstOffset value from the JSON object
-  cBlock.rawOffset = doc["rawOffset"].as<int32_t>(); // Get the rawOffset value from the JSON object
-  String timeZoneId = doc["timeZoneId"].as<String>();       // Get the timeZoneId value from the JSON object
-  String timeZoneName = doc["timeZoneName"].as<String>();   // Get the timeZoneName value from the JSON object
+  cBlock.dstOffset = doc["dstOffset"].as<int32_t>();      // Get the dstOffset value from the JSON object
+  cBlock.rawOffset = doc["rawOffset"].as<int32_t>();      // Get the rawOffset value from the JSON object
+  String timeZoneId = doc["timeZoneId"].as<String>();     // Get the timeZoneId value from the JSON object
+  String timeZoneName = doc["timeZoneName"].as<String>(); // Get the timeZoneName value from the JSON object
 
   timeZoneId.toCharArray(cBlock.timeZoneId, 17); // Convert the time
 
@@ -794,3 +867,49 @@ bool setupOTA(void)
   // Return true if successful, false otherwise
   return true;
 }
+
+void setupColors(float factor)
+{ // Change brightness in the colors array
+  int i;
+
+  for (i = 0; i < 8; i++)
+  {
+    colors[i] = RGB24To565(colorRGB[i], factor);
+  }
+  // Change brightness in individual labled colors
+  BLUE = RGB24To565(rgbBLUE, factor);
+  RED = RGB24To565(rgbRED, factor);
+  GREEN = RGB24To565(rgbGREEN, factor);
+  CYAN = RGB24To565(rgbCYAN, factor);
+  MAGENTA = RGB24To565(rgbMAGENTA, factor);
+  YELLOW = RGB24To565(rgbYELLOW, factor);
+  WHITE = RGB24To565(rgbWHITE, factor);
+
+  NIGHT1 = RGB24To565(rgbNIGHT1, factor);
+  NIGHT2 = RGB24To565(rgbNIGHT2, factor);
+  DAY1 = RGB24To565(rgbDAY1, factor);
+  DAY2 = RGB24To565(rgbDAY2, factor);
+  MYYELLOW1 = RGB24To565(rgbMYYELLOW1, factor);
+  MYYELLOW2 = RGB24To565(rgbMYYELLOW2, factor);
+
+  debugln("SetupColors");
+  // matrix.setTextColor(WHITE); // Set text color to adjusted white to match brightness
+  return;
+} // End setupColors()
+
+u16_t RGB24To565(u8_t *tmpRGB, float factor)
+{
+  return ((int)round(tmpRGB[0] * factor) & 0x00f8) << 8 | ((int)round(tmpRGB[1] * factor) & 0x00fc) << 3 | (int)round(tmpRGB[2] * factor) >> 3;
+} // End RGB24To565()
+
+bool setupNTP(void)
+{
+  // Implement NTP setup logic here
+  // Return true if successful, false otherwise
+  setServer(NTP_SERVER);
+  setInterval(0);
+  updateNTP();
+  if (timeStatus() == timeSet)
+    return true;
+  return false;
+} // End setupNTP()
