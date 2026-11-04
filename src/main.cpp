@@ -122,6 +122,13 @@
 #include "Secret-API-Keys.h" // API keys and secrets
 //  #include "OpenWeatherDefault.h"      // Default values for OpenWeather
 
+#include <Fonts/Cousine_Bold_19.h>
+#include <Fonts/Orbitron_Bold_16.h>
+#include <Fonts/Aclonica_Regular_12.h>
+#include <Fonts/Cousine_Bold_12.h>
+
+
+
 /*****************************************************************************
 ******************************  PROTOTYPES  **********************************
 *****************************************************************************/
@@ -135,6 +142,7 @@ bool setupRTC(void);
 bool setupGNSS(void);
 bool setupOTA(void);
 bool setupNTP(void);
+bool setupAstro(void);
 bool writeBlocks(void);
 bool readBlocks(void);
 void setupPControl(void);
@@ -147,21 +155,25 @@ bool readGNSS(u8_t wait = 30);
 bool readGoogleTZAPI(void);
 void setupColors(float factor);               // Function to adjust color brightness
 u16_t RGB24To565(u8_t *tmpRGB, float factor); // Function to convert 24-bit RGB to 16-bit RGB565 with brightness factor
+void displayImage(const char *filename, s16_t xloc = 0, s16_t yloc = 0);
 
+bool readAstroData(void);
 bool readMoonPhase(time_t time);
+bool isMoonVisable(void);
+bool isSunVisible(void);
 
 void programClock(bool is24hr);
-void programStartupDisplay();
-void programAstroData();
-void programWeather();
-void programTester();
-void programSystemStatus();
+void programStartupDisplay(void);
+void programAstroData(void);
+void programWeather(void);
+void programTester(void);
+void programSystemStatus(void);
+void subProgramStartup(void);
 
-
-void irLoop();
+void irLoop(void);
 void irMenu(u8_t menuNumber);
-void irMenu00();
-void irMenu01();
+void irMenu00(void);
+void irMenu01(void);
 
 /*****************************************************************************
 ******************************  GLOBALS  *************************************
@@ -174,6 +186,7 @@ static uint16_t y;
 static uint16_t z;
 bool SwapPallet = false; // Swap the color palette for the video tests
 u32_t ESPSketchSize = 0; // Size of the sketch in bytes, used for calculating free space for OTA updates
+u32_t ESPFreeSketchSpace = 0; // Free sketch space in bytes
 
 DateTime NOW;
 DateTime gnssNOW;
@@ -192,7 +205,12 @@ u32_t firstBlockADDR = 0x1000; // addr for captured data block
 bool wifiAlive = false;
 time_t wifiLastUpdate = 0; // Timestamp of the last WiFi update
 bool ntpAlive = false;
-bool otaAlive = false; // Flag to indicate if OTA is active
+bool otaAlive = false;    // Flag to indicate if OTA is active  
+bool rtcAlive = false; // Flag to indicate if RTC is active
+bool fsAlive = false; // Flag to indicate if the filesystem is active
+bool owocAlive = false; // Flag to indicate if the OWOC sensor is active
+bool framAlive = false; // Flag to indicate if the FRAM is active
+
 time_t ntpLastUpdate = 0; // Timestamp of the last NTP update
 bool googleTZAPIAlive = false;
 bool googleTZAPICurrent = false;
@@ -374,6 +392,15 @@ struct bme280Data
   time_t lastUpdate = 0; // Timestamp of the last update from the BME280 sensor
 };
 
+struct astroData
+{
+  DateTime moonRiseTime; // Moon rise time
+  DateTime moonSetTime;  // Moon set time
+  DateTime sunRiseTime;  // Sun rise time
+  DateTime sunSetTime;   // Sun set time
+  bool alive = false;    // Status of the astronomical data block
+};
+
 struct bme280Data bmeData;          // BME280 sensor data
 struct irResult irCurrent;          // Current IR command
 struct irResult irLast;             // Last IR command
@@ -381,7 +408,8 @@ struct gnssData gBlock;             // GNSS data block
 struct WCboot bootBlock;            // Boot status for WunderClock
 struct programControl pControl[10]; // Array to hold the program control structures for each program mode
 struct WCcontrol cBlock;            // Control block for WunderClock
-struct moonPhase moonPhaseData; // Moon phase data
+struct moonPhase moonPhaseData;     // Moon phase data
+struct astroData astroDataBlock;    // Astronomy data block
 
 // Names of lunar phases
 /*static const char *phaseNames[] = {"New", "Evening Crescent", "First Quarter",
@@ -413,8 +441,11 @@ Adafruit_BME280 bme;                           // I2C
 WiFiManager wm;                                // WiFiManager object
 JsonDocument doc;                              // JSON document for parsing
 Scheduler taskS;                               // TaskScheduler object
-AsyncWebServer server(80);                     // Create an AsyncWebServer object on port 80
-WiFiClientSecure client;
+SiderealPlanets myAstro;                       // The SiderealPlanets object
+MoonRise moonRise;                             // The MoonRise object really only for computing if moon over horizon
+SunRise sunRise;                               // The SunRise object really only for computing if sun over horizon
+
+AsyncWebServer server(80); // Create an AsyncWebServer object on port 80
 
 // Protomatter matrix create
 #ifdef SWAP
@@ -442,6 +473,9 @@ u16_t *videoBufferC = canvas.getBuffer();
 
 void setup()
 {
+  ESPSketchSize = ESP.getSketchSize(); // Size of the sketch in bytes
+  ESPFreeSketchSpace = ESP.getFreeSketchSpace(); // Free sketch space in bytes
+
 #ifdef DEBUG1
   // Initialize Serial port
   Serial.begin(115200);
@@ -467,6 +501,7 @@ void setup()
   }
   debugln("Blind setup complete");
   setupPControl();
+debugln("PControl setup complete");
 
 #ifdef FIRST_RUN
   writeBlocks();
@@ -483,8 +518,6 @@ void setup()
     // Perform setup for boot mode 0
     matrixErrorPrint("Factory reset in progress");
     debugln("Performing factory reset");
-
-    bootBlock.bootMode = 1; // Set to regular boot after initial setup
 
     if (!pref.begin("eeprom", false)) // Start Preferences with namespace "eeprom" and readOnly = false
     {
@@ -516,6 +549,7 @@ void setup()
     //  myTZ.clearCache();   // Clear timezone cache
 
     // Add any other settings resets here as needed
+    bootBlock.bootMode = 1; // Set to regular boot after initial setup
     writeBlocks(); // Update blocks to save factory reset status
 
     delay(3000); // Delay to ensure cache is cleared before writing
@@ -627,13 +661,27 @@ void setup()
 
   if (cBlock.otaActive)
   {
-  if (setupOTA())
-  {
-    otaAlive = true;
-    debugln("OTA setup successful"); // Set up the web server if active
-  }
+    if (setupOTA())
+    {
+      otaAlive = true;
+      debugln("OTA setup successful"); // Set up the web server if active
+    }
   }
 
+  if (cBlock.astroActive)
+  {
+    debugln("Initializing astronomical data");
+    if (setupAstro()) // Initialize the Astro library if active
+    {
+      debugln("Astro setup successful");
+    }
+    if (readAstroData()) // Read the latest astronomical data
+    {
+      debugln("Astronomical data read successfully");
+      astroDataBlock.alive = true;
+    }
+  }
+  debugln("Size of various data structures:");
   debug("Size of DateTime: ");
   debugln(sizeof(DateTime));
   debug("Size of time_t: ");
@@ -670,6 +718,8 @@ void setup()
   debugln(sizeof(irResult));
   debug("Size of bmeData: ");
   debugln(sizeof(bmeData));
+  debug("Size of astroDataBlock: ");
+  debugln(sizeof(astroDataBlock));
 
   /////////////////////////
   debugln("Setup complete");
@@ -682,7 +732,6 @@ void loop()
   if (cBlock.irActive)
     irLoop(); // Process IR input each loop iteration
 
-
   // put your main code here, to run repeatedly:
   //
   //
@@ -692,7 +741,7 @@ void loop()
   if (bootBlock.bootMode == 1)
   {
     taskS.execute(); // Execute scheduled tasks
-   // events();     // Call the events function to handle any events that have occurred
+                     // events();     // Call the events function to handle any events that have occurred
     // irMenu(pControl[cBlock.programMode].irMenuLevel); // Handle the IR menu system, pass in the current menu level from the control block
     ElegantOTA.loop(); // Handle Over The Air (OTA) updates
 
@@ -723,76 +772,70 @@ void loop()
     }
   }
 */
-  switch (progMode)
-  {
-  case 0:
-    // debug("Menu Level: ");
-    // debugln(menuLevel);
-    // setupWunderClock_Menu(menuLevel); // Main setup menu
-    programClock(cBlock.clock24hr); // Main clock program, pass in true for 24 hour clock, false for 12 hour clock
 
-    break;
-  case 1:
-    programClock(cBlock.clock24hr); // Main clock program, pass in true for 24 hour clock, false for 12 hour clock
-    break;
-  case 2:
-    programWeather();
-    break;
-  case 3:
-    programAstroData();
-    break;
-  case 4:
-    programSystemStatus();
-    break;
-  case 5:
-    programStartupDisplay();
-    break;
-  case 6:
-    programTester();
-    break;
-  case 7:
-    // videoTests_Menu();
-    programClock(cBlock.clock24hr); // Main clock program, pass in true for 24 hour clock, false for 12 hour clock
+    switch (progMode)
+    {
+    case 0:
+      // debug("Menu Level: ");
+      // debugln(menuLevel);
+      // setupWunderClock_Menu(menuLevel); // Main setup menu
+      programClock(cBlock.clock24hr); // Main clock program, pass in true for 24 hour clock, false for 12 hour clock
 
-    break;
-  case 8:
-    // tester2();
-    programClock(cBlock.clock24hr); // Main clock program, pass in true for 24 hour clock, false for 12 hour clock
+      break;
+    case 1:
+      programClock(cBlock.clock24hr); // Main clock program, pass in true for 24 hour clock, false for 12 hour clock
+      break;
+    case 2:
+      programWeather();
+      break;
+    case 3:
+      programAstroData();
+      break;
+    case 4:
+      programSystemStatus();
+      break;
+    case 5:
+      subProgramStartup();
+      break;
+    case 6:
+      programTester();
+      break;
+    case 7:
+      // videoTests_Menu();
+      programClock(cBlock.clock24hr); // Main clock program, pass in true for 24 hour clock, false for 12 hour clock
 
-    break;
-  case 9:
-    // controledRestart();
-    programClock(cBlock.clock24hr); // Main clock program, pass in true for 24 hour clock, false for 12 hour clock
+      break;
+    case 8:
+      // tester2();
+      programClock(cBlock.clock24hr); // Main clock program, pass in true for 24 hour clock, false for 12 hour clock
 
-    break;
-  default:
-    break;
-  }
+      break;
+    case 9:
+      // controledRestart();
+      programClock(cBlock.clock24hr); // Main clock program, pass in true for 24 hour clock, false for 12 hour clock
 
-  ////////////////////////////////////////////////
-  // delay(1000); // Delay for 1 second before next update
+      break;
+    default:
+      break;
+    }
 
-  irCurrent.command = 0; // Clear the current IR command after processing
+    ////////////////////////////////////////////////
+    // delay(1000); // Delay for 1 second before next update
 
+    irCurrent.command = 0; // Clear the current IR command after processing
 
-
-
-
-
-
-
-
-
-  matrix.fillScreen(0);
-  matrix.setCursor(0, 16); // Move cursor to the first line for UTC time
-  matrix.print(UTC.dateTime(ISO8601).c_str());
-  matrix.setCursor(0, 32); // Move cursor to next line for additional info
-  matrix.print(myTZ.dateTime(ISO8601).c_str());
-  matrix.setCursor(0, 48); // Move cursor to next line for additional info
-
-  // matrix.print("Loop running");
-  matrix.show();
-} //End if (bootBlock.bootMode == 1)
+    /*
+      matrix.fillScreen(0);
+      matrix.setCursor(0, 16); // Move cursor to the first line for UTC time
+      matrix.print(UTC.dateTime(ISO8601).c_str());
+      matrix.setCursor(0, 32); // Move cursor to next line for additional info
+      matrix.print(myTZ.dateTime(ISO8601).c_str());
+      matrix.setCursor(0, 48); // Move cursor to next line for additional info
+      matrix.print(progMode);
+    */
+    // matrix.print("Loop running");
+    matrix.show();
+  } // End if (bootBlock.bootMode == 1)
 } // End loop()
 
 /*****************************************************************************
@@ -823,6 +866,10 @@ bool blindSetup(void)
     matrixErrorPrint("RTC setup failed");
     while (1)
       ;
+  }
+  else
+  {
+    rtcAlive = true;
   }
 
   return true;
@@ -888,6 +935,7 @@ bool setupFRAM(void)
   else
   {
     debugln("LittleFS started successfully");
+    fsAlive = true;
   }
 
   // begin FRAM
@@ -901,6 +949,7 @@ bool setupFRAM(void)
   else
   {
     debugln("FRAM found");
+    framAlive = true;
   }
   // Add code to initialize FRAM
   return true; // Return true if setup is successful
@@ -1642,17 +1691,263 @@ bool readMoonPhase(time_t time)
 void programClock(bool is24hr)
 {
   // Add code to program the clock with the specified 24-hour format setting
-}
+  // Add code to display the clock on the matrix display
+  // Use the is24hr parameter to determine whether to display time in 24 hour format or 12 hour format
+  // u32_t timer = millis(); // Timer for testing the program execution time
 
-void programStartupDisplay()
-{
-  // Add code to program the startup display
+  irMenu(pControl[cBlock.programMode].irMenuLevel); // Handle the IR menu system, pass in the current menu level from the control block
+
+  // Set up variables for the clock display
+
+  char timeBuffer[12]; // Holds formatted time string
+  int indent;          // Left margin for prints to screen
+  char AMPM;
+  u8_t Hour;
+  if (!cBlock.timezoneActive)
+  {
+    NOW = UTC.now();
+  }
+  if (cBlock.displayTZLocal)
+  {
+    NOW = myTZ.now();
+  }
+  else
+  {
+    // If set to other timezone
+  }
+  Hour = NOW.hour();
+  u8_t Font = cBlock.fontChoiceClock;
+  // Font = 1; // Force font for testing
+  if (!is24hr)
+  {
+    if (Hour == 0)
+      Hour = 12;
+    if (Hour > 12)
+      Hour -= 12;
+    AMPM = 'A';
+    if (NOW.isPM())
+      AMPM = 'P';
+  }
+
+  String dayOfWeek;
+  u8_t dayOfWeekLength = 0;             // Length of the day of the week string
+  dayOfWeek = myTZ.dateTime("l");       // Get the day of the week from the timezone object. That's a lowercase L
+  dayOfWeekLength = dayOfWeek.length(); // Get the length of the day of the week string
+
+  // set colors and font based on time of day
+  if (isSunVisible())        // If the sun is visible, use day or night colors
+    canvas.fillScreen(BLUE); // Clear the canvas with the background color
+  else
+    canvas.fillScreen(NIGHT2); // Clear the canvas with the background color
+  canvas.setTextColor(MYYELLOW2);
+
+  if (Font == 1)
+  {
+    // canvas.setFont(&Orbitron_Bold_16);
+    // canva.setFont(&Cousine_Regular_16);
+    // canvas.setFont(0);
+    // canvas.setFont(&Cousine_Bold_Italic_16);
+    // canvas.setFont(&Cousine_Bold_16);
+    // canvas.setFont(&Cousine_Bold_17);
+    // canvas.setFont(&Cousine_Bold_18);
+    canvas.setFont(&Cousine_Bold_19);
+    // canvas.setFont(&Cousine_Bold_21);
+
+    indent = 5;
+    //  indent = 10;
+    canvas.setCursor(indent, 18); // 18 is the base line of the font
+    snprintf(timeBuffer, sizeof(timeBuffer), "%d/%02d/%02d", NOW.year(), NOW.month(), NOW.day());
+    canvas.print(timeBuffer);
+
+    // DOW -- Day of the week
+    indent = 65 - (dayOfWeekLength * 6); //
+                                         //  indent = 61 - (dayOfWeekLength * 5); // 6 is half the width of the font in pixels or close to it
+    canvas.setCursor(indent, 36);        // 32 is the base line of the font
+    canvas.print(dayOfWeek);             // Print the day of the week to the matrix
+
+    // TIME 12Hr
+    if (!is24hr)
+    {
+      if (Hour < 10)
+        indent = 10; //  Left margin for 1 digit hour
+      else
+        indent = 5; //  Left margin for 2 digit hour
+      canvas.setCursor(indent, 58);
+      snprintf(timeBuffer, sizeof(timeBuffer), "%d:%02d:%02d%cM", Hour, NOW.minute(), NOW.second(), AMPM); // Format the time string
+      canvas.print(timeBuffer);
+    }
+    else // TIME 24Hr
+    {
+      indent = 17; //  Left margin for 2 digit hour
+      canvas.setCursor(indent, 58);
+      snprintf(timeBuffer, sizeof(timeBuffer), "%02d:%02d:%02d", NOW.hour(), NOW.minute(), NOW.second()); // Format the time string
+      canvas.print(timeBuffer);
+    }
+  }
+  if (Font == 2)
+  {
+    canvas.setFont(&Orbitron_Bold_16);
+    // canva.setFont(&Cousine_Regular_16);
+    // canvas.setFont(0);
+    // canvas.setFont(&Cousine_Bold_Italic_16);
+    // canvas.setFont(&Cousine_Bold_16);
+    // canvas.setFont(&Cousine_Bold_17);
+    // canvas.setFont(&Cousine_Bold_18);
+    // canvas.setFont(&Cousine_Bold_19);
+    // canvas.setFont(&Cousine_Bold_21);
+
+    indent = 3;
+    //  indent = 10;
+    canvas.setCursor(indent, 18); // 18 is the base line of the font
+    snprintf(timeBuffer, sizeof(timeBuffer), "%d/%02d/%02d", NOW.year(), NOW.month(), NOW.day());
+    canvas.print(timeBuffer);
+
+    // DOW -- Day of the week
+    indent = 63 - (dayOfWeekLength * 6); // adjust to centerr
+    canvas.setCursor(indent, 36);        //
+    canvas.print(dayOfWeek);             // Print the day of the week to the matrix
+
+    // TIME 12Hr
+    if (!is24hr)
+    {
+      if (Hour < 10)
+        indent = 19; //  Left margin for 1 digit hour
+      else
+        indent = 12; //  Left margin for 2 digit hour
+      canvas.setCursor(indent, 58);
+      snprintf(timeBuffer, sizeof(timeBuffer), "%d:%02d:%02d", Hour, NOW.minute(), NOW.second()); // Format the time string
+      canvas.print(timeBuffer);
+      canvas.setCursor(96, 58 - 16);                         // Position for AM/PM
+      snprintf(timeBuffer, sizeof(timeBuffer), "%cM", AMPM); // Format the time string
+      canvas.print(timeBuffer);
+    }
+    else // TIME 24Hr
+    {
+      indent = 15; //  Left margin for 2 digit hour
+      canvas.setCursor(indent, 58);
+      snprintf(timeBuffer, sizeof(timeBuffer), "%02d:%02d:%02d", NOW.hour(), NOW.minute(), NOW.second()); // Format the time string
+      canvas.print(timeBuffer);
+    }
+  }
+  ////////    after font cases
+  matrix.drawRGBBitmap(0, 0, canvas.getBuffer(), canvas.width(), canvas.height()); // Clear the screen with the background color
+  matrix.show();                                                                   // Copy data to matrix buffer
+
+  // debugln(millis() - timer); // Print the time it took to update the clock menu to the serial monitor for debugging purposes
+
+  return;
 }
 
 void programAstroData()
 {
-  // Add code to program the astronomy data display
-}
+  // u32_t timer = millis(); // Timer for testing the program execution time
+
+  u8_t progMode = cBlock.programMode;                            // Set the program mode to the system status menuu
+  u8_t *subprogA = &(pControl[progMode].subProgram);             // Get the submenu number for the system status menu
+  u8_t subprogV = pControl[progMode].subProgram;                 // Get the submenu number value for the system status menu
+  bool *progactiveA = &(pControl[progMode].programActive);       // Get the program active status for the system status menu
+  bool *subprogactiveA = &(pControl[progMode].subProgramActive); // Get the submenu status for the system status menu
+  u8_t subprogtotal = pControl[progMode].subProgramTotal;        // Get the total number of submenus for the system status menu
+  u8_t *irmenulevelA = &(pControl[progMode].irMenuLevel);        // Get the IR menu level for the system status menu
+
+  *irmenulevelA = 1;
+
+  //*progactiveA = false; // Set the program active status to false to force the program to update the display with new data when it runs
+
+  // Add code to display the astronomical data on the matrix display
+  if (!pControl[cBlock.programMode].programActive)
+  {
+    canvas.fillRect(0, 0, 128, 64, BLACK); // Fill the canvas with the background color
+    canvas.setTextWrap(false);
+
+    // canvas.setFont(&Orbitron_Medium_12); // Use built-in font
+    // canvas.setFont(&Aclonica_Regular_12);
+    // canvas.setFont(&Cousine_Bold_12);
+    canvas.setFont();
+    // canvas.setTextSize(1);
+    //  canvas.setFont(&Cousine_Regular_10); // Set the font for the matrix display
+    //  canvas.setFont(&GohuFont6x11b);
+    //  canvas.setFont(&Cousine_Bold_12);                        // Set the font for the matrix display
+    canvas.setTextColor(MYYELLOW2, BLACK);                                // Set the text color for the matrix display
+    canvas.setCursor(2, 8);                                               // Set the cursor position to the top left corner of the matrix display
+    canvas.print("Sr-");                                                  // Print the sunrise time label to the matrix display
+    canvas.print(dateTime(astroDataBlock.sunRiseTime.unixtime(), "H:i")); // Print the sunrise time to the matrix display
+    canvas.setCursor(2, 20);                                              // Set the cursor position to the next line of the matrix display
+    canvas.print("Ss-");
+    canvas.print(dateTime(astroDataBlock.sunSetTime.unixtime(), "H:i")); // Print the sunset time to the matrix display
+
+    canvas.setCursor(2, 32);                                               // Set the cursor position to the next line of the matrix display
+    canvas.print("Mr-");                                                   // Print the moonrise time label to the matrix display
+    canvas.print(dateTime(astroDataBlock.moonRiseTime.unixtime(), "H:i")); // Print the moonrise time to the matrix display
+    canvas.setCursor(2, 44);                                               // Set the cursor position to the next line of the matrix display
+    canvas.print("Ms-");                                                   // Print the moonset time label to the matrix display
+    canvas.print(dateTime(astroDataBlock.moonSetTime.unixtime(), "H:i"));  // Print the moonset time to the matrix display
+    canvas.setCursor(2, 56);                                               // Set the cursor position to the next line of the matrix display
+    canvas.print("");                                                      // Print the moon phase label to the matrix display
+    // canvas.setFont(&Cousine_Regular_10);                         // Set the font for the matrix display
+    // canvas.setFont(&GohuFont6x11b);
+    canvas.setTextColor(MYYELLOW2, BLACK);
+    canvas.print(moonPhaseData.phaseName); // Print the moon phase name to the matrix display
+    // Create the moon image file name based on the moon phase
+    char moonfile[12]; // Initialize the moon file name
+    snprintf(moonfile, sizeof(moonfile), "/moon%02.0f.bmp", moonPhaseData.phase * 100);
+    // debugln(moonfile);
+
+    if (isMoonVisable())
+    {
+      canvas.fillRect(64, 0, 128, 32, BLACK); // Fill the right side with a night color rectangle
+      displayImage(moonfile, 80, 0);          // Display the moon image on the matrix
+    }
+    else
+    {
+      canvas.fillRect(64, 32, 128, 64, BLACK); // Fill the right side with a night color rectangle
+      displayImage(moonfile, 80, 32);          // Display a default moon image if the moon is not visible
+    }
+
+    // Clear the screen
+    matrix.fillScreen(BLACK);
+    matrix.drawRGBBitmap(0, 0, canvas.getBuffer(), canvas.width(), canvas.height()); // Clear the screen with the background color
+    // matrix.show();
+    // Copy data to matrix buffer
+
+    // tShowMatrix.enable(); // Enable the showMatrixTask to update the display with the new data
+  }
+
+  matrix.setTextWrap(false);
+  matrix.setFont();
+  matrix.setTextSize(1);
+  matrix.setTextColor(MYYELLOW2, BLACK); // Set the text color for the matrix display
+
+  if (isMoonVisable())
+  {
+    matrix.fillRect(64, 32, 127, 63, BLACK); // Fill the right side with a night color rectangle
+    matrix.setCursor(74, 44);
+    matrix.print("Till Set");
+    matrix.setCursor(74, 56);
+    u32_t moonsetCounter = astroDataBlock.moonSetTime.unixtime() - myTZ.now();
+    matrix.print(dateTime(moonsetCounter, "H:i:s")); // Print the moonset counter to the canvas display
+  }
+  else
+  {
+    matrix.fillRect(64, 0, 127, 32, BLACK); // Fill the right side with a night color rectangle
+    matrix.setCursor(69, 8);
+    matrix.print("Till Rise");
+    matrix.setCursor(71, 20);
+    u32_t moonriseCounter = astroDataBlock.moonRiseTime.unixtime() - myTZ.now(); // Calculate the moonrise counter
+    matrix.print(dateTime(moonriseCounter, "H:i:s"));                            // Print the moonrise counter to the canvas display
+  }
+
+  pControl[cBlock.programMode].programActive = true; // Set the program active flag to true to indicate that the program is running
+
+  // debugln(millis() - timer); // Print the time it took to update the astronomical data menu to the serial monitor for debugging purposes
+
+  // irLoop();
+  irMenu(*irmenulevelA); // Call the IR menu function to handle IR commands for the system status menu
+                         // this needs to be after the scheduler task is enabled and all other stored variables
+                         // are updated so that they are not reset by program
+
+  return;
+} // end programAstroData()
 
 void programWeather()
 {
@@ -1664,7 +1959,389 @@ void programTester()
   // Add code to program the tester display
 }
 
+bool isMoonVisable()
+{
+  time_t t = makeTime(UTC.hour(), UTC.minute(), UTC.second(), UTC.day(), UTC.month(), UTC.year());
+
+  moonRise.calculate(cBlock.latitude, cBlock.longitude, t);
+
+  return moonRise.isVisible; // Return true if the moon is visible, false if not
+} // End isMoonVisable()
+
+bool isSunVisible()
+{
+  time_t t = makeTime(UTC.hour(), UTC.minute(), UTC.second(), UTC.day(), UTC.month(), UTC.year());
+
+  sunRise.calculate(cBlock.latitude, cBlock.longitude, t);
+
+  return sunRise.isVisible; // Return true if the sun is visible, false if not
+} // End isSunVisible()
+
+bool readAstroData()
+{
+  double myAstroTMP;
+
+  myAstro.doMoon();                                                                               // Calculate the moon position
+  myAstro.doMoonRiseSetTimes();                                                                   // Calculate the moon rise and set times
+  myAstroTMP = myAstro.getMoonriseTime() * 3600.0;                                                // Calculate the moon rise time in seconds
+  astroDataBlock.moonRiseTime = DateTime(year(), month(), day(), 0, 0, 0) + TimeSpan(myAstroTMP); // Set the moon rise time to the current date
+  myAstroTMP = myAstro.getMoonsetTime() * 3600.0;                                                 // Calculate the moon set time
+  astroDataBlock.moonSetTime = DateTime(year(), month(), day(), 0, 0, 0) + TimeSpan(myAstroTMP);  // Set the moon set time to the current date
+
+  myAstro.doSun();                                                                               // Calculate the sun position
+  myAstro.doSunRiseSetTimes();                                                                   // Calculate the sun rise and set times
+  myAstroTMP = myAstro.getSunriseTime() * 3600.0;    
+  debugln(myAstroTMP);                           // Calculate the sun rise time
+  astroDataBlock.sunRiseTime = DateTime(year(), month(), day(), 0, 0, 0) + TimeSpan(myAstroTMP); // Set the sun rise time to the current date
+  myAstroTMP = myAstro.getSunsetTime() * 3600.0;
+  debugln(myAstroTMP);                                                 // Calculate the sun set time
+  astroDataBlock.sunSetTime = DateTime(year(), month(), day(), 0, 0, 0) + TimeSpan(myAstroTMP);  // Set the sun set time to the current date
+
+  // Get the moon phase
+  readMoonPhase(UTC.now());
+  myAstro.getMoonPhase(); // Get the moon phase
+
+  return true;
+} // End readAstroData()
+
+void displayImage(const char *filename, s16_t xloc, s16_t yloc)
+{
+  u8_t tempcolor[3]; // Temporary color buffer for RGB values
+
+  File file = LittleFS.open(filename, "r");
+  if (!file)
+  {
+    debugln("Failed to open image file!");
+    return;
+  }
+
+  // Read image dimensions
+  int16_t ImageWidth, ImageHeight;
+  file.seek(18);
+  file.read((u8_t *)&ImageWidth, 4);
+  file.read((u8_t *)&ImageHeight, 4);
+
+  // Read image data
+  file.seek(54); // BMP header size
+  uint16_t rowSize = (ImageWidth * 3 + 3) & ~3;
+  u8_t *displayImageBuffer = (u8_t *)malloc(rowSize);
+
+  for (int16_t y = ImageHeight - 1; y >= 0; y--)
+  {
+    file.read(displayImageBuffer, rowSize);
+    for (int16_t x = 0; x < ImageWidth; x++)
+    {
+      tempcolor[2] = displayImageBuffer[x * 3];                                                                     // Blue
+      tempcolor[1] = displayImageBuffer[x * 3 + 1];                                                                 // Green
+      tempcolor[0] = displayImageBuffer[x * 3 + 2];                                                                 // Red
+      videoBufferC[(y + yloc) * MatrixWidth + (x + xloc)] = RGB24To565(tempcolor, cBlock.matrixBrightness / 255.0); // Set the pixel color in the buffer
+      // matrix.drawPixel(x + xloc, y + yloc, AdjRGB_565(tempcolor, CBlock.MatrixBrightness / 255.0));
+    }
+  }
+  file.close();
+  free(displayImageBuffer);
+} // End displayImage()
+
+bool setupAstro()
+{
+  myAstro.begin();
+
+  // Set up the Astro object
+  myAstro.setLatLong(cBlock.latitude, cBlock.longitude); // Set the location of the observer
+  myAstro.setTimeZone(cBlock.rawOffset / 3600);          // Set the timezone offset in hours
+  myAstro.setElevationM(cBlock.elevation);               // Set the elevation of the observer in meters
+
+  if (myTZ.isDST() || cBlock.dstOffset != 0)
+    myAstro.setDST(); // Set DST to true
+  else
+    myAstro.rejectDST(); // Set DST to false
+
+  if (!gBlock.current && googleTZAPICurrent)
+  {
+    myAstro.setGMTdate(UTC.year(), UTC.month(), UTC.day()); // Set the local date in seconds since epoch
+    debugln("Setting UTC time");
+    debugln("UTC: " + UTC.dateTime());                               // Print the UTC date and time to the serial monitor
+    myAstro.setLocalTime(myTZ.hour(), myTZ.minute(), myTZ.second()); // Set the local time in seconds since epoch
+    debugln(myAstro.getLT());
+  }
+  else
+  {
+    myAstro.setGMTdate(gBlock.year, gBlock.month, gBlock.day); // Set the date in GMT
+    debugln("Setting GMT time from GNSS");
+    myAstro.setGMTtime(gBlock.hour, gBlock.minute, gBlock.second); // Set the time in GMT
+  }
+
+  return true;
+} // End setupAstro()
+
 void programSystemStatus()
 {
-  // Add code to program the system status display
-}
+  // Add code to display the system status menu on the matrix display
+
+  // u32_t timer = millis(); // Get the current time in milliseconds
+
+  u8_t progMode = cBlock.programMode;                            // Set the program mode to the system status menuu
+  u8_t *subprogA = &(pControl[progMode].subProgram);             // Get the submenu number for the system status menu
+  u8_t subprogV = pControl[progMode].subProgram;                 // Get the submenu number value for the system status menu
+  bool *progactiveA = &(pControl[progMode].programActive);       // Get the program active status for the system status menu
+  bool *subprogactiveA = &(pControl[progMode].subProgramActive); // Get the submenu status for the system status menu
+  u8_t subprogtotal = pControl[progMode].subProgramTotal;        // Get the total number of submenus for the system status menu
+  u8_t *irmenulevelA = &(pControl[progMode].irMenuLevel);        // Get the IR menu level for the system status menu
+
+  *irmenulevelA = 1;
+  // irLoop();
+  irMenu(*irmenulevelA); // Call the IR menu function to handle IR commands for the system status menu
+  switch (*subprogA)
+  {
+  case 0:
+  {
+    // debugln(subprogV);
+    matrix.fillScreen(BLUE); // Clear the matrix display
+    // matrix.setFont(&Cousine_Bold_12); // Set the font for the matrix display
+     //matrix.setFont(&Orbitron_Bold_14);
+    //matrix.setFont(&Orbitron_Medium_12);
+    matrix.setFont(&Aclonica_Regular_12);
+    //matrix.setFont();
+    matrix.setTextColor(MYYELLOW1); // Set the text color for the matrix display
+    matrix.setCursor(0, 12);        // Set the cursor position to the top left corner
+    matrix.print(" Heap: ");
+    matrix.println(ESP.getFreeHeap()); // Print the free heap memory
+
+    matrix.setCursor(0, 24); // Move cursor down
+    matrix.print(" CPU: ");
+    matrix.print(ESP.getCpuFreqMHz());
+    matrix.println(" MHz"); // Print the CPU frequency in MHz
+
+    matrix.setCursor(0, 36); // Move cursor down
+    matrix.print(" Size: ");
+    matrix.println(ESPSketchSize); // Print the sketch size in bytes
+
+    // DateTime now = DateTime(year(), month(), day(), hour(), minute(), second());
+    matrix.setCursor(0, 48); // Move cursor down
+    matrix.print(" IP:");
+    matrix.setCursor(0, 60);                 // Move cursor down
+    matrix.print(" "+WiFi.localIP().toString()); // Print the local IP address of the WiFi connection
+    matrix.show();                           // Show the updated data on the matrix display
+
+    break;
+  }
+
+  case 1:
+  {
+    matrix.fillScreen(BLUE);          // Clear the matrix display
+    matrix.setFont(&Cousine_Bold_12); // Set the font for the matrix display
+
+    matrix.setTextColor(MYYELLOW1); // Set the text color for the matrix display
+    matrix.setCursor(0, 12);        // Set the cursor position to the top left corner
+    matrix.print("SIV:");
+    matrix.println(gBlock.SIV); // Print the number of satellites in view
+
+    matrix.setCursor(0, 24); // Move cursor down
+    matrix.print("Lat:");
+    matrix.println(cBlock.latitude, 6); // Print the latitude with 6 decimal places
+
+    matrix.setCursor(0, 36); // Move cursor down
+    matrix.print("Lon:");
+    matrix.println(cBlock.longitude, 6); // Print the longitude with 6 decimal places
+
+    // DateTime now = DateTime(year(), month(), day(), hour(), minute(), second());
+    matrix.setCursor(0, 48); // Move cursor down
+    matrix.print("Elv:");
+    matrix.println(cBlock.elevation, 2); // Print the elevation with 2 decimal places
+    matrix.show();                       // Show the updated data on the matrix display
+
+    break;
+  }
+
+  case 2:
+  {
+    subProgramStartup(); // Call the subProgramStartup function to display the system status information on the matrix display
+    break;
+  }
+  default:
+    break;
+  }
+  // Show the system status on the matrix display
+  // debugln(millis() - timer); // Print the time it took to update the system status menu to the serial monitor for debugging purposes
+  return;
+} // end programSystemStatus()
+
+void subProgramStartup()
+{
+  // Add code to display the main menu on the matrix display
+  u8_t progMode = cBlock.programMode;                            // Set the program mode to the system status menuu
+  u8_t *subprogA = &(pControl[progMode].subProgram);             // Get the submenu number for the system status menu
+  u8_t subprogV = pControl[progMode].subProgram;                 // Get the submenu number value for the system status menu
+  bool *progactiveA = &(pControl[progMode].programActive);       // Get the program active status for the system status menu
+  bool *subprogactiveA = &(pControl[progMode].subProgramActive); // Get the submenu status for the system status menu
+  u8_t subprogtotal = pControl[progMode].subProgramTotal;        // Get the total number of submenus for the system status menu
+  u8_t *irmenulevelA = &(pControl[progMode].irMenuLevel);        // Get the IR menu level for the system status menu
+
+  *irmenulevelA = 1;
+  // irLoop();
+  irMenu(*irmenulevelA); // Call the IR menu function to handle IR commands for the system status menu
+
+  // Show the system information on the matrix display
+  matrix.fillScreen(BLUE);          // Clear the matrix display
+  matrix.setFont(&Cousine_Bold_12); // Set the font for the matrix display
+
+  // Display the system status information on the matrix display with color coding for each item
+  // CFMO -- C is for RTClock, F is for File system, M is for Memory FRAM, O is for OTA
+  // X is for not active, red is for active but not working, green is for active and working
+  //
+
+  matrix.setTextColor(BLACK); // Set the text color for the matrix display
+  matrix.setCursor(0, 12);    // Set the cursor position to the top left corner
+
+  matrix.print("SI: "); // CFM -- C is for RTClock, F is for File system, M is for Memory FRAM, O is for OTA
+  if (rtcAlive)
+  {
+    matrix.setTextColor(GREEN); // Set text color to green if RTC is set up
+    matrix.print("C");
+  }
+  else
+  {
+    matrix.setTextColor(RED); // Set text color to red if RTC is not set up
+    matrix.print("C");
+  }
+  if (fsAlive)
+  {
+    matrix.setTextColor(GREEN); // Set text color to green if RTC is set up
+    matrix.print("F");
+  }
+  else
+  {
+    matrix.setTextColor(RED); // Set text color to red if RTC is not set up
+    matrix.print("F");
+  }
+  if (framAlive)
+  {
+    matrix.setTextColor(GREEN); // Set text color to green if RTC is set up
+    matrix.print("M");
+  }
+  else
+  {
+    matrix.setTextColor(RED); // Set text color to red if RTC is not set up
+    matrix.print("M");
+  }
+
+  if (otaAlive)
+  {
+    matrix.setTextColor(GREEN); // Set text color to green if RTC is set up
+    matrix.print("O");
+  }
+  else
+  {
+    matrix.setTextColor(RED); // Set text color to red if RTC is not set up
+    matrix.print("O");
+  }
+
+  matrix.setTextColor(BLACK); // Set the text color for the matrix display
+  matrix.setCursor(0, 24);    // Move cursor down
+  matrix.print("WIFI:  ");
+  if (cBlock.wifiActive)
+  {
+    if (wifiAlive)
+    {
+      matrix.setTextColor(GREEN); // Set text color to green if RTC is set up
+      matrix.print("X");
+    }
+    else
+    {
+      matrix.setTextColor(RED); // Set text color to red if RTC is not set up
+      matrix.print("X");
+    }
+  }
+  else
+  {
+    matrix.print("X");
+  }
+
+  matrix.setTextColor(BLACK); // Set the text color for the matrix display
+  matrix.setCursor(0, 36);    // Move cursor down
+  matrix.print("GNSS:  ");
+  if (cBlock.gnssActive)
+  {
+    if (gBlock.current)
+    {
+      matrix.setTextColor(GREEN); // Set text color to green if RTC is set up
+      matrix.print("X");
+    }
+    else
+    {
+      matrix.setTextColor(RED); // Set text color to red if RTC is not set up
+      matrix.print("X");
+    }
+  }
+  else
+  {
+    matrix.print("X");
+  }
+
+  matrix.setTextColor(BLACK); // Set the text color for the matrix display
+  matrix.setCursor(0, 48);    // Move cursor down
+  matrix.print("NTP:   ");
+  if (cBlock.ntpActive)
+  {
+    if (ntpAlive)
+    {
+      matrix.setTextColor(GREEN); // Set text color to green if RTC is set up
+      matrix.print("X");
+    }
+    else
+    {
+      matrix.setTextColor(RED); // Set text color to red if RTC is not set up
+      matrix.print("X");
+    }
+  }
+  else
+  {
+    matrix.print("X");
+  }
+
+  matrix.setTextColor(BLACK); // Set the text color for the matrix display
+  matrix.setCursor(0, 60);    // Move cursor down
+  matrix.print("Wx:    ");
+  if (cBlock.owocActive)
+  {
+    if (owocAlive)
+    {
+      matrix.setTextColor(GREEN); // Set text color to green if RTC is set up
+      matrix.print("X");
+    }
+    else
+    {
+      matrix.setTextColor(RED); // Set text color to red if RTC is not set up
+      matrix.print("X");
+    }
+  }
+  else
+  {
+    matrix.print("X");
+  }
+
+  matrix.setTextColor(GREEN); // Set the text color for the matrix display
+  matrix.setCursor(64, 12);   // Move cursor to the right side
+  matrix.print(" C");
+  matrix.setTextColor(BLACK);
+  matrix.print("lock");
+  matrix.setCursor(64, 24);
+  matrix.setTextColor(GREEN); // Set the text color for the matrix display
+  matrix.print(" F");
+  matrix.setTextColor(BLACK);
+  matrix.print("ileSys");
+  matrix.setTextColor(GREEN); // Set the text color for the matrix display
+  matrix.setCursor(64, 36);
+  matrix.print(" M");
+  matrix.setTextColor(BLACK);
+  matrix.print("emory");
+  matrix.setTextColor(GREEN); // Set the text color for the matrix display
+  matrix.setCursor(64, 48);
+  matrix.print(" O");
+  matrix.setTextColor(BLACK);
+  matrix.print("TA");
+
+  matrix.show(); // Show the updated data on the matrix display
+
+  return;
+} // end subProgramStartup()
