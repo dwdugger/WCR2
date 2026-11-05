@@ -113,21 +113,20 @@
 #include <SiderealPlanets.h>         // https://github.com/DavidArmstrong/SiderealPlanets.git
 #include <MoonRise.h>                // https://github.com/signetica/MoonRise.git
 #include <SunRise.h>                 // https://github.com/signetica/SunRise.git
+#include <OpenWeatherOneCall.h>      // https://github.com/JHershey69/OpenWeatherOneCall.git
 
 #include <WiFiClientSecure.h> // Core library - Secure WiFi client for HTTPS requests
 #include <HTTPClient.h>       // Core library - HTTP client
 
-#include "rgbColors.h"       // Color definitions
-#include "ir.h"              // IR remote control handling
-#include "Secret-API-Keys.h" // API keys and secrets
-//  #include "OpenWeatherDefault.h"      // Default values for OpenWeather
+#include "rgbColors.h"          // Color definitions
+#include "ir.h"                 // IR remote control handling
+#include "Secret-API-Keys.h"    // API keys and secrets
+#include "OpenWeatherDefault.h" // Default values for OpenWeather
 
 #include <Fonts/Cousine_Bold_19.h>
 #include <Fonts/Orbitron_Bold_16.h>
 #include <Fonts/Aclonica_Regular_12.h>
 #include <Fonts/Cousine_Bold_12.h>
-
-
 
 /*****************************************************************************
 ******************************  PROTOTYPES  **********************************
@@ -143,6 +142,8 @@ bool setupGNSS(void);
 bool setupOTA(void);
 bool setupNTP(void);
 bool setupAstro(void);
+bool setupOWOC(void);
+bool readOWOC(void);
 bool writeBlocks(void);
 bool readBlocks(void);
 void setupPControl(void);
@@ -184,8 +185,8 @@ u16_t noise[MAX_DIMENSION][MAX_DIMENSION];
 static uint16_t x;
 static uint16_t y;
 static uint16_t z;
-bool SwapPallet = false; // Swap the color palette for the video tests
-u32_t ESPSketchSize = 0; // Size of the sketch in bytes, used for calculating free space for OTA updates
+bool SwapPallet = false;      // Swap the color palette for the video tests
+u32_t ESPSketchSize = 0;      // Size of the sketch in bytes, used for calculating free space for OTA updates
 u32_t ESPFreeSketchSpace = 0; // Free sketch space in bytes
 
 DateTime NOW;
@@ -205,11 +206,12 @@ u32_t firstBlockADDR = 0x1000; // addr for captured data block
 bool wifiAlive = false;
 time_t wifiLastUpdate = 0; // Timestamp of the last WiFi update
 bool ntpAlive = false;
-bool otaAlive = false;    // Flag to indicate if OTA is active  
-bool rtcAlive = false; // Flag to indicate if RTC is active
-bool fsAlive = false; // Flag to indicate if the filesystem is active
-bool owocAlive = false; // Flag to indicate if the OWOC sensor is active
-bool framAlive = false; // Flag to indicate if the FRAM is active
+bool otaAlive = false;     // Flag to indicate if OTA is active
+bool rtcAlive = false;     // Flag to indicate if RTC is active
+bool fsAlive = false;      // Flag to indicate if the filesystem is active
+bool owocAlive = false;    // Flag to indicate if the OWOC sensor is active
+time_t owocLastUpdate = 0; // Timestamp of the last OpenWeatherOneCall update
+bool framAlive = false;    // Flag to indicate if the FRAM is active
 
 time_t ntpLastUpdate = 0; // Timestamp of the last NTP update
 bool googleTZAPIAlive = false;
@@ -298,7 +300,7 @@ struct gnssData
   u8_t second = 0;      // GNSS second
   bool alive = false;
   bool current = false;
-  time_t lastUpdate = 0; // Timestamp of the last GNSS update
+  time_t gnssLastUpdate = 0; // Timestamp of the last GNSS update
 };
 
 struct irResult
@@ -310,17 +312,19 @@ struct irResult
 
 struct weatherData // Weather data struct
 {
-  long dayTime = 0;       // Daytime timestamp
-  float temp = 0;         // Temperature
-  float feelsLike = 0;    // Feels like temperature
-  float humidity = 0;     // Humidity
-  float hPaPressure = 0;  // Pressure
-  float inHgPressure = 0; // Pressure in inches of mercury
-  float mmHgPressure = 0; // Pressure in millimeters of mercury
-  float windSpeed = 0;    // Wind speed
-  float windBearing = 0;  // Wind direction in degrees
-  float windGust = 0;     // Wind gust speed
-  float pop = 0;          // Probability of precipitation
+  long dayTime = 0;          // Daytime timestamp
+  float temp = 0;            // Temperature
+  float feelsLike = 0;       // Feels like temperature
+  float humidity = 0;        // Humidity
+  float hPaPressure = 0;     // Pressure
+  float inHgPressure = 0;    // Pressure in inches of mercury
+  float mmHgPressure = 0;    // Pressure in millimeters of mercury
+  float windSpeed = 0;       // Wind speed
+  float windBearing = 0;     // Wind direction in degrees
+  float windGust = 0;        // Wind gust speed
+  float pop = 0;             // Probability of precipitation
+  bool current = false;      // Indicates if the weather data is alive
+  time_t owocLastUpdate = 0; // Timestamp of the last weather update
   /*
   float rain = 0;        // Rain volume
   float snow = 0;        // Snow volume
@@ -380,16 +384,16 @@ struct WCdata // Captured data struct for WunderClock
 
 struct bme280Data
 {
-  double temp_C;         // Temperature from the BME280 in Celsius
-  double temp_F;         // Temperature from the BME280 in Fahrenheit
-  double pressure_hPa;   // Pressure from the BME280 in hPa
-  double pressure_inHg;  // Pressure from the BME280 in inches of mercury
-  double pressure_mmHg;  // Pressure from the BME280 in mm of mercury
-  double humidity;       // Humidity from the BME280 in %
-  double altitude;       // Altitude calculated from the BME280 in meters
-  double elevation;      // Elevation from settings in meters
-  bool alive = false;    // Status of the BME280 sensor
-  time_t lastUpdate = 0; // Timestamp of the last update from the BME280 sensor
+  double temp_C;            // Temperature from the BME280 in Celsius
+  double temp_F;            // Temperature from the BME280 in Fahrenheit
+  double pressure_hPa;      // Pressure from the BME280 in hPa
+  double pressure_inHg;     // Pressure from the BME280 in inches of mercury
+  double pressure_mmHg;     // Pressure from the BME280 in mm of mercury
+  double humidity;          // Humidity from the BME280 in %
+  double altitude;          // Altitude calculated from the BME280 in meters
+  double elevation;         // Elevation from settings in meters
+  bool alive = false;       // Status of the BME280 sensor
+  time_t bmeLastUpdate = 0; // Timestamp of the last update from the BME280 sensor
 };
 
 struct astroData
@@ -410,6 +414,8 @@ struct programControl pControl[10]; // Array to hold the program control structu
 struct WCcontrol cBlock;            // Control block for WunderClock
 struct moonPhase moonPhaseData;     // Moon phase data
 struct astroData astroDataBlock;    // Astronomy data block
+struct weatherData wBlock;          // Weather data block
+struct dailyWeather owocDataBlock;  // Open Weather OneCall data block
 
 // Names of lunar phases
 /*static const char *phaseNames[] = {"New", "Evening Crescent", "First Quarter",
@@ -444,6 +450,7 @@ Scheduler taskS;                               // TaskScheduler object
 SiderealPlanets myAstro;                       // The SiderealPlanets object
 MoonRise moonRise;                             // The MoonRise object really only for computing if moon over horizon
 SunRise sunRise;                               // The SunRise object really only for computing if sun over horizon
+OpenWeatherOneCall owoc;                       // OpenWeatherOneCall object
 
 AsyncWebServer server(80); // Create an AsyncWebServer object on port 80
 
@@ -473,7 +480,7 @@ u16_t *videoBufferC = canvas.getBuffer();
 
 void setup()
 {
-  ESPSketchSize = ESP.getSketchSize(); // Size of the sketch in bytes
+  ESPSketchSize = ESP.getSketchSize();           // Size of the sketch in bytes
   ESPFreeSketchSpace = ESP.getFreeSketchSpace(); // Free sketch space in bytes
 
 #ifdef DEBUG1
@@ -501,7 +508,7 @@ void setup()
   }
   debugln("Blind setup complete");
   setupPControl();
-debugln("PControl setup complete");
+  debugln("PControl setup complete");
 
 #ifdef FIRST_RUN
   writeBlocks();
@@ -550,7 +557,7 @@ debugln("PControl setup complete");
 
     // Add any other settings resets here as needed
     bootBlock.bootMode = 1; // Set to regular boot after initial setup
-    writeBlocks(); // Update blocks to save factory reset status
+    writeBlocks();          // Update blocks to save factory reset status
 
     delay(3000); // Delay to ensure cache is cleared before writing
 
@@ -681,6 +688,27 @@ debugln("PControl setup complete");
       astroDataBlock.alive = true;
     }
   }
+
+  if (cBlock.owocActive)
+  {
+    if (setupOWOC())
+    {
+      owocAlive = true;
+      debugln("OpenWeatherOneCall setup successful");
+      debugln("OpenWeatherOneCall is alive");
+    }
+  }
+
+  if (owocAlive)
+  {
+    if (readOWOC()) // Read the latest OpenWeatherOneCall data
+    {
+      wBlock.current = true;
+      wBlock.owocLastUpdate = myTZ.now();
+      debugln("OpenWeatherOneCall data read successfully");
+    }
+  }
+
   debugln("Size of various data structures:");
   debug("Size of DateTime: ");
   debugln(sizeof(DateTime));
@@ -1079,7 +1107,7 @@ bool readGNSS(u8_t wait)
       gBlock.minute = gnss.getMinute();
       gBlock.second = gnss.getSecond();
       gnssNOW = DateTime(gBlock.year, gBlock.month, gBlock.day, gBlock.hour, gBlock.minute, gBlock.second);
-      gBlock.lastUpdate = UTC.now();
+      gBlock.gnssLastUpdate = UTC.now();
 
       debugln("gnss date & time valid");
 
@@ -1607,7 +1635,7 @@ bool readBME280()
   bmeData.pressure_mmHg = bmeData.pressure_hPa * 0.750062;   // Convert to mm of mercury
   bmeData.altitude = bme.readAltitude(SEALEVELPRESSURE_HPA); // Read the altitude from the BME280 in meters
   bmeData.humidity = bme.readHumidity();                     // Read the humidity from the BME280 in percent
-  bmeData.lastUpdate = myTZ.now();
+  bmeData.bmeLastUpdate = myTZ.now();
 
   debug("BME280 Temperature: ");
   debug(bmeData.temp_F);
@@ -1949,11 +1977,6 @@ void programAstroData()
   return;
 } // end programAstroData()
 
-void programWeather()
-{
-  // Add code to program the weather display
-}
-
 void programTester()
 {
   // Add code to program the tester display
@@ -1988,14 +2011,14 @@ bool readAstroData()
   myAstroTMP = myAstro.getMoonsetTime() * 3600.0;                                                 // Calculate the moon set time
   astroDataBlock.moonSetTime = DateTime(year(), month(), day(), 0, 0, 0) + TimeSpan(myAstroTMP);  // Set the moon set time to the current date
 
-  myAstro.doSun();                                                                               // Calculate the sun position
-  myAstro.doSunRiseSetTimes();                                                                   // Calculate the sun rise and set times
-  myAstroTMP = myAstro.getSunriseTime() * 3600.0;    
-  debugln(myAstroTMP);                           // Calculate the sun rise time
+  myAstro.doSun();             // Calculate the sun position
+  myAstro.doSunRiseSetTimes(); // Calculate the sun rise and set times
+  myAstroTMP = myAstro.getSunriseTime() * 3600.0;
+  debugln(myAstroTMP);                                                                           // Calculate the sun rise time
   astroDataBlock.sunRiseTime = DateTime(year(), month(), day(), 0, 0, 0) + TimeSpan(myAstroTMP); // Set the sun rise time to the current date
   myAstroTMP = myAstro.getSunsetTime() * 3600.0;
-  debugln(myAstroTMP);                                                 // Calculate the sun set time
-  astroDataBlock.sunSetTime = DateTime(year(), month(), day(), 0, 0, 0) + TimeSpan(myAstroTMP);  // Set the sun set time to the current date
+  debugln(myAstroTMP);                                                                          // Calculate the sun set time
+  astroDataBlock.sunSetTime = DateTime(year(), month(), day(), 0, 0, 0) + TimeSpan(myAstroTMP); // Set the sun set time to the current date
 
   // Get the moon phase
   readMoonPhase(UTC.now());
@@ -2098,10 +2121,10 @@ void programSystemStatus()
     // debugln(subprogV);
     matrix.fillScreen(BLUE); // Clear the matrix display
     // matrix.setFont(&Cousine_Bold_12); // Set the font for the matrix display
-     //matrix.setFont(&Orbitron_Bold_14);
-    //matrix.setFont(&Orbitron_Medium_12);
+    // matrix.setFont(&Orbitron_Bold_14);
+    // matrix.setFont(&Orbitron_Medium_12);
     matrix.setFont(&Aclonica_Regular_12);
-    //matrix.setFont();
+    // matrix.setFont();
     matrix.setTextColor(MYYELLOW1); // Set the text color for the matrix display
     matrix.setCursor(0, 12);        // Set the cursor position to the top left corner
     matrix.print(" Heap: ");
@@ -2119,9 +2142,9 @@ void programSystemStatus()
     // DateTime now = DateTime(year(), month(), day(), hour(), minute(), second());
     matrix.setCursor(0, 48); // Move cursor down
     matrix.print(" IP:");
-    matrix.setCursor(0, 60);                 // Move cursor down
-    matrix.print(" "+WiFi.localIP().toString()); // Print the local IP address of the WiFi connection
-    matrix.show();                           // Show the updated data on the matrix display
+    matrix.setCursor(0, 60);                       // Move cursor down
+    matrix.print(" " + WiFi.localIP().toString()); // Print the local IP address of the WiFi connection
+    matrix.show();                                 // Show the updated data on the matrix display
 
     break;
   }
@@ -2345,3 +2368,353 @@ void subProgramStartup()
 
   return;
 } // end subProgramStartup()
+
+void programWeather()
+{
+  // Add code to display the weather menu on the matrix display
+
+  // u32_t timer = millis(); // Timer for testing the program execution time
+
+  // Set up variables for the weather menu display
+  irMenu(pControl[cBlock.programMode].irMenuLevel); // Handle the IR menu system, pass in the current menu level from the control block
+
+  u8_t indent; // Left margin for prints to screen
+
+  // IRMenu(1); // Call the IR menu function to handle IR commands
+
+  // matrix.setFont(&Cousine_Regular_16);
+
+  // #include <Fonts/Cousine_Bold_16.h>
+  // #include <Fonts/Cousine_Bold_12.h>
+  // #include <Fonts/Cousine_Regular_12.h>
+  // #include <Fonts/Cousine_Regular_10.h>
+  // matrix.setFont();
+  // matrix.setFont(&Cousine_Bold_12);
+  matrix.setFont(&Aclonica_Regular_12);
+
+  matrix.fillScreen(BLUE);        // Erase the screen
+  matrix.setTextColor(MYYELLOW2); // Set text color
+
+  indent = 3;
+
+  matrix.setCursor(indent, 12);
+  matrix.print("Indoor");
+  matrix.setCursor(64, 12);
+  matrix.print("Outdoor");
+  matrix.setCursor(indent, 24);
+  matrix.print(bmeData.temp_F);
+  matrix.print("F");
+  matrix.setCursor(64, 24);
+  matrix.print(wBlock.temp);
+  matrix.print("F");
+  matrix.setCursor(indent, 36);
+  matrix.print(bmeData.humidity);
+  matrix.print("%");
+  matrix.setCursor(64, 36);
+  matrix.print(wBlock.humidity);
+  matrix.print("%");
+  matrix.setCursor(65 - ((String("Pressure").length() / 2) * 9), 48); // want to center next line
+  matrix.print("Pressure");
+  u8_t indentPressure = 65 - (((String(wBlock.inHgPressure).length() + 5) / 2) * 9);
+  // debugln(wBlock.pressure);
+  // debugln(String(wBlock.pressure).length());
+  // debugln(indentPressure);
+  matrix.setCursor(indentPressure, 60); // want to center next line
+  matrix.print(wBlock.inHgPressure);
+  matrix.print(" inHg");
+
+  /*
+  // matrix.setFont(&Cousine_Bold_12);
+  matrix.setCursor(0, 10); // 11 is the base line of the font
+  matrix.print("IN");
+  matrix.setCursor(40, 10);
+  matrix.print("OUT");
+  matrix.setCursor(80, 10);
+  matrix.print("Serv");
+  matrix.setCursor(indent, 20);     // 20 is the base line of the font
+                                    //  matrix.setFont(&GohuFont6x11b);
+  matrix.print(clockPressure_inHg); // Print the pressure to the matrix
+  matrix.print("inHg");
+  matrix.setCursor(indent + 40, 20);
+  // matrix.print("inHg");
+  matrix.setCursor(indent + 65, 20);
+  matrix.print(wBlock.pressure * 0.02953); // Print the server pressure to the matrix
+  matrix.print("inHg");
+  matrix.setCursor(indent, 30); // 30 is the base line of the font
+  // matrix.print("Temp");               // Print the title to line
+  // matrix.setCursor(indent, 41);     // 41 is the base line of the font
+  matrix.print(clockTemp_F); // Print the temperature to the matrix
+  matrix.print("F");         // Print the temperature unit to the matrix
+  // matrix.print("°/F");               // Print the temperature unit to the matrix
+  matrix.setCursor(indent + 80, 30); // 30 is the base line of the font
+  matrix.print(wBlock.temp);
+  matrix.print("F");
+  matrix.setCursor(indent, 40); // 52 is the base line of the font
+
+  // matrix.print("Humidity");           // Print the title to line
+  //  matrix.setCursor(indent, 63);       // 63 is the base line of the font
+  matrix.print(clockHumidity);       // Print the humidity to the matrix
+  matrix.print("%");                 // Print the humidity unit to the matrix
+  matrix.setCursor(indent + 80, 40); // 52 is the base line of the font
+  matrix.print(wBlock.humidity);
+  matrix.print("%");
+  */
+  matrix.show();
+
+  // debugln(millis() - timer); // Print the time it took to update the weather menu to the serial monitor for debugging purposes
+
+  return;
+} // end programWeather()
+
+bool setupOWOC()
+{
+  // Get the weather data from Open Weather API
+  // This is a placeholder for the Open Weather API code
+  // You will need to use the Open Weather API to get the weather data from the gnss location
+  // You will need to use the latitude and longitude from the gnss location to get the weather data
+  // You will need to use the Open Weather API key to access the API
+
+  ONECALLKEY[KeyOpenWeatherAPI.length()];        // OpenWeatherOneCall API key;
+  strcpy(ONECALLKEY, KeyOpenWeatherAPI.c_str()); // Copy the key to the char array
+
+  // Only needed if WiFiTri installed for Triangulation may have fee from Google
+  // #define GOOGLEKEY "YOUR GOOGLE DEVELOPER API KEY""
+
+  //  OpenWeatherOneCall API Options and Settings
+
+  //*************** LOCATION ************************
+
+  myTimeZone = doc["rawOffset"].as<int32_t>() / 3600; //<--------- GMT OFFSET in hours
+
+  // Location MODES are used to tell the program how you are delivering your coordinates:
+  //  1 LAT/LON  <----- Can be from GPS, manual as below, or whatever method gets you a latitude and longitude except IP location
+  //  2 CITYID   <----- From OpenWeatherMap City ID list. Not very accurate.
+  //  3 IP ADDRESS [NOT REALLY SUGGESTED CAN BE WILDLY OFFSET LOCATION IF HOTSPOT]
+
+  locationMode = 1;
+
+  // For Latitude and Longitude Location MODE 1 setting if used
+  //  myLATITUDE = gnss.getLatitude() / 10000000.0;   // Latitude in Degrees
+  //  myLONGITUDE = gnss.getLongitude() / 10000000.0; // Longitude in Degrees
+  myLATITUDE = cBlock.latitude;   // Latitude in Degrees
+  myLONGITUDE = cBlock.longitude; // Longitude in Degrees
+
+  // For City ID Location MODE setting if used
+  myCITYID = 4504476; //<-----Toms River, NJ USA
+
+  //*************** END LOCATION **********************
+
+  //*************** FLAGS *****************************
+  myCURRENT = 1;                               //<-----0 is CURRENT off, 1 is on
+  myAIRQUALITY = 1;                            //<-----0 is Air Quality off, 1 is on
+  myTIMESTAMP = 0;                             //<-----0 is TIMESTAMP off, 1 is TIMESTAMP on
+  const char timestampDate[11] = "03/08/2025"; //<-----MM/DD/YYYY right here limit is 4 days in future, past is 01/01/1979
+  myOVERVIEW = 0;                              //<-----0 is OVERVIEW off, 1 is OVERVIEW on
+  const char overviewDate[9] = "TOMORROW";     //<-----"TODAY" or "TOMORROW"
+  //***************************************************
+
+  //************** EXCLUDES ***************************
+  // Excludes are EXCL_D, EXCL_H, EXCL_M, EXCL_A
+  // Those are DAILY, HOURLY, MINUTELY, and ALERTS
+  // You set them like this: myEXCLUDES = EXCL_D+EXCL_H+EXCL_M+EXCL_A
+  // If you leave them set to 0 as below you get a JSON file with ALL CURRENT WEATHER measurements
+  // which is a huge file
+
+  myEXCLUDES = EXCL_M; //<-----0 Excludes is default
+  //***************************************************
+
+  //*************** UNITS OF MEASURMENT and DATE TIME FORMAT ***************
+  if (cBlock.unitsImperial)
+  {
+    myUNITS = IMPERIAL; //<-----METRIC, IMPERIAL, KELVIN (IMPERIAL is default)
+  }
+  else
+  {
+    myUNITS = METRIC;
+  }
+  // Date Time Format
+  myDTF = 1; /*
+                   1 M/D/Y 24H
+                   2 D/M/Y 24H
+                   3 M/D/Y 12H
+                   4 D/M/Y 12H
+                   5/6 TIME ONLY 24H
+                   7/8 TIME ONLY 12H
+                   9 DAY SHORTNAME
+                   10 M/D/Y ONLY,
+                   11 D/M/Y ONLY
+
+                   ISO8601 options:
+                   12 YYYY-MM-DD ONLY,
+                   13 THH:MM:SS ONLY
+                   14 YYYY-MM-DDTHH:MM:SSY 24H
+                   */
+  //************************************************************************
+  nextCall = 0;
+
+  return true; // Return true if setup is successful
+} // End setupOWOC()
+
+bool readOWOC()
+{
+  /*****************************************************************************************
+   * Open Weather Setup
+   * This is the Open Weather API setup. It will get the weather data from Open Weather API.
+   * Boat load of setup and returned data.
+   *****************************************************************************************/
+  owoc.parseWeather();
+  debugln("Open Weather OneCall object parsed");
+
+  // Verify all other values exist before using
+
+  if (owoc.current) // Check if data is in the struct for all variables before using them
+  {
+    wBlock.dayTime = owoc.current->dayTime;
+    wBlock.temp = owoc.current->temperature;
+    wBlock.feelsLike = owoc.current->apparentTemperature;
+    wBlock.windSpeed = owoc.current->windSpeed;
+    wBlock.windBearing = owoc.current->windBearing;
+    wBlock.humidity = owoc.current->humidity;
+    wBlock.hPaPressure = owoc.current->pressure;
+    wBlock.inHgPressure = wBlock.hPaPressure * 0.029529983071445;
+    wBlock.mmHgPressure = wBlock.hPaPressure * 0.750061561303;
+    debugln("dayTime");
+    debugln(wBlock.dayTime);
+    debugln("temp");
+    debugln(wBlock.temp);
+    debugln("feelsLike");
+    debugln(wBlock.feelsLike);
+    debugln("windSpeed");
+    debugln(wBlock.windSpeed);
+    debugln("windBearing");
+    debugln(wBlock.windBearing);
+    debugln("humidity");
+    debugln(wBlock.humidity);
+    debugln("pressure");
+    debug(wBlock.hPaPressure);
+    debugln(" hPa");
+    debug(wBlock.inHgPressure);
+    debugln(" inHg");
+    debug(wBlock.mmHgPressure);
+    debugln(" mmHg");
+
+    /*
+    debugln(String(wBlock.hPaPressure).length() + "hPa");
+    debugln(String(wBlock.inHgPressure).length() + "inHg");
+    debugln(String(wBlock.mmHgPressure).length() + "mmHg");
+    */
+  }
+  else
+  {
+    debugln("CURRENT IS OFF or EMPTY");
+  }
+
+  // Forecast is part of CURRENT and has info for the 8 days future weather. See variables PDF
+  //  The JSON holds this info in the DAILY section and EXCL_D turns this off
+  if (owoc.forecast)
+  { // Check if data is in the struct for all variables before using them
+    wBlock.pop = owoc.forecast[0].pop;
+    wBlock.windGust = owoc.forecast[0].windGust;
+    debugln("pop");
+    debugln(wBlock.pop);
+    debugln("windGust");
+    debugln(wBlock.windGust);
+  }
+  else
+    debugln("FORECAST IS OFF or EMPTY");
+
+  /*
+  { // Check if data is in the struct for all variables before using them
+    Serial.printf("\nFORECAST - Up to 8 days future forecast\n");
+    for (int x = 0; x < 8; x++)
+    {
+      Serial.printf("Date: %s High Temperature: % .0f\n", owoc.forecast[x].readableDateTime, owoc.forecast[x].temperatureHigh);
+    }
+  }
+  else
+    Serial.printf("\nFORECAST IS OFF or EMPTY\n");
+
+  // Hour is part of CURRENT and has info for 48 hours future weather. See variables PDF
+  //  The JSON holds this info in the HOURLY section and EXCL_H turns this off
+  if (owoc.hour)
+  { // Check if data is in the struct for all variables before using them
+    Serial.printf("\nHOURLY   - Up to 48 hours forecast\n");
+
+    for (int x = 0; x < 6; x++)
+    {
+      Serial.printf("%s Actual Temp: % .0f\n", owoc.hour[x].readableTime, owoc.hour[x].temperature);
+      Serial.printf("%s Feels Like Temp: % .0f\n", owoc.hour[x].readableTime, owoc.hour[x].apparentTemperature);
+    }
+  }
+  else
+    Serial.printf("\nHOURLY IS OFF or EMPTY\n");
+
+  // MINUTELY is part of CURRENT and has info for 60 minutes future weather. See variables PDF
+  //  The JSON holds this info in the MINUTELY section and EXCL_M turns this off
+  if (owoc.minute)
+  { // Check if data is in the struct for all variables before using them
+    Serial.printf("\nMINUTELY   - Up to 60 minutes precipitation forecast\n");
+
+    for (int x = 0; x < 30; x++)
+    {
+      Serial.printf("%s Precipitation: % .2f\n", owoc.minute[x].readableTime, owoc.minute[x].precipitation);
+    }
+  }
+  else
+    Serial.printf("\nHOURLY IS OFF or EMPTY\n");
+
+  // ALERTS is part of CURRENT and has info for alerts in your area. See variables PDF
+  //  The JSON holds this info in the ALERTS section and EXCL_A turns this off
+  if (owoc.alert) // Check if data is in the struct for all variables before using them
+  {
+    Serial.printf("\nALERT *** ALERT *** ALERT\n");
+    Serial.printf("Sender : % s\n", owoc.alert->senderName);
+    Serial.printf("Event : % s\n", owoc.alert->event);
+    Serial.printf("ALERT : % s\n", owoc.alert->summary);
+  }
+  else
+  {
+    Serial.printf("\nNo Alerts For Area, Alerts are EXCLUDED, or Alerts struct is empty\n");
+  }
+
+  // The following sections are separate from CURRENT and are turned off and on with their own flags
+
+  if (owoc.timestamp)
+  { // Check if data is in the struct for all variables before using them
+    Serial.printf("\nTIMESTAMP - Single day weather for any date from 01-01-1979 to 4 days in future\n");
+    Serial.printf("% s - % s\nTemperature: % .0f\nFeels like: % .0f\nHumidity: % .0F%%\n", owoc.timestamp[0].weekDayName, owoc.timestamp[0].readableDateTime, owoc.timestamp[0].temperature, owoc.timestamp[0].apparentTemperature, owoc.timestamp[0].humidity);
+  }
+  else
+    Serial.printf("\nTIMESTAMP IS OFF or EMPTY\n");
+
+  if (owoc.overView) // Check if data is in the struct for all variables before using them
+  {
+    Serial.printf("\nOVERVIEW - Summary for TODAY or TOMORROW generated by AI\n");
+
+    // Print the struct values to verify
+    Serial.printf("Latitude: %.6f\n", owoc.overView->lat); // %.6f for printing double with 6 decimal places
+    Serial.printf("Longitude: %.6f\n", owoc.overView->lon);
+    Serial.printf("Timezone: %s\n", owoc.overView->tz); // %s for const char* (string)
+    Serial.printf("Date: %s\n", owoc.overView->date);
+    Serial.printf("Units: %s\n", owoc.overView->units);
+    Serial.printf("Weather Overview: %s\n", owoc.overView->weather_overview);
+  }
+  else
+    Serial.printf("\nOVERVIEW IS OFF or EMPTY\n");
+
+  if (owoc.quality) // Check if data is in the struct for all variables before using them
+  {
+    Serial.printf("\nAir Quality and Pollution Numbers for today");
+    Serial.printf("\nAir Quality : % d\n", owoc.quality->aqi);
+    Serial.printf("Carbon : % .2f\n", owoc.quality->co);
+    Serial.printf("Nitrogen : % .2f\n", owoc.quality->no);
+    Serial.printf("Ozone : % .2f\n", owoc.quality->o3);
+  }
+  else
+    Serial.printf("\nAIR QUALITY IS OFF or EMPTY\n");
+
+
+   */
+
+  return true; // Return true if read is successful
+} // End readOWOCData()
