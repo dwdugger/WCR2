@@ -151,7 +151,6 @@ bool bootBlockRead(void);
 bool bootBlockWrite(void);
 bool readBME280(void);
 bool setupWiFi(void);
-bool setupTaskScheduler(void);
 bool readGNSS(u8_t wait = 30);
 bool readGoogleTZAPI(void);
 void setupColors(float factor);               // Function to adjust color brightness
@@ -176,10 +175,16 @@ void irMenu(u8_t menuNumber);
 void irMenu00(void);
 void irMenu01(void);
 
+void taskTimeExe();  // Function to execute time-related tasks
+void taskAstroExe(); // Function to execute astronomical data-related tasks
+bool taskTmpExe();   // Function to execute temperature-related tasks
+
 /*****************************************************************************
 ******************************  GLOBALS  *************************************
 *****************************************************************************/
 // Way to many, will try slim it down.
+
+bool HouseKeeping = false;
 
 u16_t noise[MAX_DIMENSION][MAX_DIMENSION];
 static uint16_t x;
@@ -473,6 +478,8 @@ u16_t *videoBufferC = canvas.getBuffer();
 
 // Task tShowMatrix(TASK_SECOND, TASK_FOREVER, &showMatrixTask); // Task to show the matrix display
 // Task tShowMatrix(1000, TASK_FOREVER, &showMatrixTask); // Task to show the matrix display
+Task taskTime(10000, TASK_FOREVER, &taskTimeExe);            // Task for handling time-related operations
+Task taskAstro(TASK_HOUR * 24, TASK_FOREVER, &taskAstroExe); // Task for handling astronomical data
 
 /*****************************************************************************
 *****************************  SETUP  ****************************************
@@ -482,6 +489,9 @@ void setup()
 {
   ESPSketchSize = ESP.getSketchSize();           // Size of the sketch in bytes
   ESPFreeSketchSpace = ESP.getFreeSketchSpace(); // Free sketch space in bytes
+
+  taskS.addTask(taskTime);
+  taskS.addTask(taskAstro);
 
 #ifdef DEBUG1
   // Initialize Serial port
@@ -709,6 +719,11 @@ void setup()
     }
   }
 
+  taskS.init();
+  // Basic set up done.
+  //
+  //
+
   debugln("Size of various data structures:");
   debug("Size of DateTime: ");
   debugln(sizeof(DateTime));
@@ -748,6 +763,10 @@ void setup()
   debugln(sizeof(bmeData));
   debug("Size of astroDataBlock: ");
   debugln(sizeof(astroDataBlock));
+  debugln(bootBlock.bootCount);
+
+  bootBlock.bootCount++;
+  writeBlocks(); // Write the current state of the data blocks to FRAM
 
   /////////////////////////
   debugln("Setup complete");
@@ -773,14 +792,24 @@ void loop()
     // irMenu(pControl[cBlock.programMode].irMenuLevel); // Handle the IR menu system, pass in the current menu level from the control block
     ElegantOTA.loop(); // Handle Over The Air (OTA) updates
 
-    /*
+    if (cBlock.wifiActive && wifiAlive && (WiFi.status() != WL_CONNECTED))
+    {
+      debugln("WiFi NOT connected");
+      wm.autoConnect(); // Attempt to reconnect to WiFi if it is not connected
+    }
+
+    if (myTZ.hour() == 0 && myTZ.minute() >= 1 && myTZ.isAM())
+    {
+      taskAstro.enableIfNot();
+    }
+
     // Check Local Time to see if it is housekeeping time
     if (!HouseKeeping)
     {
       if (myTZ.hour() == 3 && myTZ.minute() == 15 && myTZ.isAM()) // 3:15 AM local time
       {
         debugln("Housekeeping time, do something here");
-        updateBlocks(); // Update the data block in the FRAM with the new values
+        writeBlocks(); // Update the data block in the FRAM with the new values
         debugln("Blocks updated");
         // Do something here, like update the NTP server or do some other housekeeping task
         // or just do nothing and let the clock run
@@ -793,77 +822,55 @@ void loop()
       debugln("Housekeeping done, reset flag");
     }
 
-    if (cBlock.wifiActive && wifiAlive && (WiFi.status() != WL_CONNECTED))
-    {
-      debugln("WiFi NOT connected");
-      wm.autoConnect(); // Attempt to reconnect to WiFi if it is not connected
-    }
-  }
-*/
-
-    switch (progMode)
-    {
-    case 0:
-      // debug("Menu Level: ");
-      // debugln(menuLevel);
-      // setupWunderClock_Menu(menuLevel); // Main setup menu
-      programClock(cBlock.clock24hr); // Main clock program, pass in true for 24 hour clock, false for 12 hour clock
-
-      break;
-    case 1:
-      programClock(cBlock.clock24hr); // Main clock program, pass in true for 24 hour clock, false for 12 hour clock
-      break;
-    case 2:
-      programWeather();
-      break;
-    case 3:
-      programAstroData();
-      break;
-    case 4:
-      programSystemStatus();
-      break;
-    case 5:
-      subProgramStartup();
-      break;
-    case 6:
-      programTester();
-      break;
-    case 7:
-      // videoTests_Menu();
-      programClock(cBlock.clock24hr); // Main clock program, pass in true for 24 hour clock, false for 12 hour clock
-
-      break;
-    case 8:
-      // tester2();
-      programClock(cBlock.clock24hr); // Main clock program, pass in true for 24 hour clock, false for 12 hour clock
-
-      break;
-    case 9:
-      // controledRestart();
-      programClock(cBlock.clock24hr); // Main clock program, pass in true for 24 hour clock, false for 12 hour clock
-
-      break;
-    default:
-      break;
-    }
-
-    ////////////////////////////////////////////////
-    // delay(1000); // Delay for 1 second before next update
-
-    irCurrent.command = 0; // Clear the current IR command after processing
-
-    /*
-      matrix.fillScreen(0);
-      matrix.setCursor(0, 16); // Move cursor to the first line for UTC time
-      matrix.print(UTC.dateTime(ISO8601).c_str());
-      matrix.setCursor(0, 32); // Move cursor to next line for additional info
-      matrix.print(myTZ.dateTime(ISO8601).c_str());
-      matrix.setCursor(0, 48); // Move cursor to next line for additional info
-      matrix.print(progMode);
-    */
-    // matrix.print("Loop running");
-    matrix.show();
   } // End if (bootBlock.bootMode == 1)
+
+  switch (progMode)
+  {
+  case 0:
+    // this will be setup
+    programClock(cBlock.clock24hr); // Main clock program, pass in true for 24 hour clock, false for 12 hour clock
+
+    break;
+  case 1:
+    programClock(cBlock.clock24hr); // Main clock program, pass in true for 24 hour clock, false for 12 hour clock
+    break;
+  case 2:
+    programWeather();
+    break;
+  case 3:
+    programAstroData();
+    break;
+  case 4:
+    programSystemStatus();
+    break;
+  case 5:
+    subProgramStartup();
+    break;
+  case 6:
+    programTester();
+    break;
+  case 7:
+    // videoTests_Menu();
+    programClock(cBlock.clock24hr); // Main clock program, pass in true for 24 hour clock, false for 12 hour clock
+
+    break;
+  case 8:
+    // tester2();
+    programClock(cBlock.clock24hr); // Main clock program, pass in true for 24 hour clock, false for 12 hour clock
+
+    break;
+  case 9:
+    // controledRestart();
+    programClock(cBlock.clock24hr); // Main clock program, pass in true for 24 hour clock, false for 12 hour clock
+
+    break;
+  default:
+    break;
+  }
+
+  irCurrent.command = 0; // Clear the current IR command after processing
+
+  matrix.show();
 } // End loop()
 
 /*****************************************************************************
@@ -1097,9 +1104,6 @@ bool readGNSS(u8_t wait)
       gBlock.longitude = gnss.getLongitude() / 10000000.0; // Convert to Degrees
       gBlock.elevation = gnss.getAltitudeMSL() / 1000.0;   // Convert to Meters above mean sea level
       gBlock.SIV = gnss.getSIV();                          // Number of satellites in view
-      cBlock.latitude = gBlock.latitude;
-      cBlock.longitude = gBlock.longitude;
-      cBlock.elevation = gBlock.elevation;
       gBlock.year = gnss.getYear();
       gBlock.month = gnss.getMonth();
       gBlock.day = gnss.getDay();
@@ -1110,6 +1114,22 @@ bool readGNSS(u8_t wait)
       gBlock.gnssLastUpdate = UTC.now();
 
       debugln("gnss date & time valid");
+      if (fabs(gBlock.latitude - cBlock.latitude) >= 0.1 || fabs(gBlock.longitude - cBlock.longitude) >= 0.1)
+      {
+        matrixErrorPrint("Latitude or Longitude deviation exceeds threshold");
+        cBlock.latitude = gBlock.latitude;
+        cBlock.longitude = gBlock.longitude;
+        cBlock.elevation = gBlock.elevation;
+        writeBlocks();
+        while (1)
+          ;
+      }
+      else
+      {
+        cBlock.latitude = gBlock.latitude;
+        cBlock.longitude = gBlock.longitude;
+        cBlock.elevation = gBlock.elevation;
+      }
 
       debug("GNSS Latitude: ");
       debugln(gBlock.latitude);
@@ -1658,14 +1678,6 @@ bool readBME280()
 
   return true; // Return true if read is successful
 } // end readBME280()
-
-bool setupTaskScheduler(void)
-{
-  // Add code to initialize the task scheduler
-  taskS.init();
-
-  return true; // Return true if setup is successful
-} // end setupTaskScheduler()
 
 bool readMoonPhase(time_t time)
 {
@@ -2718,3 +2730,43 @@ bool readOWOC()
 
   return true; // Return true if read is successful
 } // End readOWOCData()
+
+u8_t checkStatus()
+{
+  // will check the status of the system and return a status code
+  // how long the system has BME280,
+  return 0;
+}
+
+bool hiLoData()
+{
+  // record hi/lo
+  return true;
+}
+
+bool checkAstro()
+{
+  //
+  return true;
+}
+
+void taskTimeExe()
+{
+  // Execute time-related tasks
+  if (cBlock.gnssActive && gBlock.alive)
+  {
+    // Execute time-related tasks here
+    readGNSS();
+  }
+}
+
+void taskAstroExe()
+{
+  // Execute astronomical data-related tasks
+}
+
+bool taskTmpExe()
+{
+  // Execute temperature-related tasks
+  return true;
+}
