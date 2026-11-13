@@ -100,6 +100,7 @@
 #include <RTClib.h>                  // https://github.com/adafruit/RTClib.git
 #include <ezTime.h>                  // https://github.com/ropg/ezTime.git
 #include <Adafruit_BME280.h>         // https://github.com/adafruit/Adafruit_BME280_Library.git
+#include <Adafruit_PCF8574.h>        // https://github.com/adafruit/Adafruit_PCF8574.git
 #include <WiFiManager.h>             // https://github.com/tzapu/WiFiManager.git
 #include <Adafruit_FRAM_I2C.h>       // https://github.com/adafruit/Adafruit_FRAM_I2C.git
 #include <SparkFun_u-blox_GNSS_v3.h> // https://github.com/sparkfun/SparkFun_u-blox_GNSS_v3.git
@@ -155,7 +156,7 @@ bool readGNSS(u8_t wait = 30);
 bool readGoogleTZAPI(void);
 void setupColors(float factor);               // Function to adjust color brightness
 u16_t RGB24To565(u8_t *tmpRGB, float factor); // Function to convert 24-bit RGB to 16-bit RGB565 with brightness factor
-void displayImage(const char *filename, s16_t xloc = 0, s16_t yloc = 0);
+void displayBmpImage(const char *filename, s16_t xloc = 0, s16_t yloc = 0);
 
 bool readAstroData(void);
 bool readMoonPhase(time_t time);
@@ -175,9 +176,10 @@ void irMenu(u8_t menuNumber);
 void irMenu00(void);
 void irMenu01(void);
 
-void taskTimeExe();  // Function to execute time-related tasks
-void taskAstroExe(); // Function to execute astronomical data-related tasks
-bool taskTmpExe();   // Function to execute temperature-related tasks
+void taskTimeExe();   // Function to execute time-related tasks
+void taskAstroExe();  // Function to execute astronomical data-related tasks
+void taskBME280Exe(); // Function to execute BME280 sensor-related tasks
+bool taskTmpExe();    // Function to execute temperature-related tasks
 
 /*****************************************************************************
 ******************************  GLOBALS  *************************************
@@ -478,8 +480,9 @@ u16_t *videoBufferC = canvas.getBuffer();
 
 // Task tShowMatrix(TASK_SECOND, TASK_FOREVER, &showMatrixTask); // Task to show the matrix display
 // Task tShowMatrix(1000, TASK_FOREVER, &showMatrixTask); // Task to show the matrix display
-Task taskTime(10000, TASK_FOREVER, &taskTimeExe);            // Task for handling time-related operations
-Task taskAstro(TASK_HOUR * 24, TASK_FOREVER, &taskAstroExe); // Task for handling astronomical data
+Task taskTime(TASK_HOUR * 2, TASK_FOREVER, &taskTimeExe);       // Task for handling time-related operations
+Task taskAstro(TASK_HOUR * 24, TASK_FOREVER, &taskAstroExe);    // Task for handling astronomical data
+Task taskBME280(TASK_MINUTE * 5, TASK_FOREVER, &taskBME280Exe); // Task for handling BME280 sensor data
 
 /*****************************************************************************
 *****************************  SETUP  ****************************************
@@ -492,6 +495,8 @@ void setup()
 
   taskS.addTask(taskTime);
   taskS.addTask(taskAstro);
+  taskS.addTask(taskBME280);
+  debugln("Tasks added");
 
 #ifdef DEBUG1
   // Initialize Serial port
@@ -668,6 +673,7 @@ void setup()
   {
     if (bme.begin(BME280_ADDRESS, &Wire)) // Start the BME280 for temperature, humidity and pressure.
     {
+      debugln("BME280 setup successful");
       bmeData.alive = true;
     }
     if (bmeData.alive)
@@ -719,7 +725,9 @@ void setup()
     }
   }
 
-  taskS.init();
+  // taskS.init();
+  taskTime.enable();
+  taskBME280.enable();
   // Basic set up done.
   //
   //
@@ -763,6 +771,9 @@ void setup()
   debugln(sizeof(bmeData));
   debug("Size of astroDataBlock: ");
   debugln(sizeof(astroDataBlock));
+
+  debugln(TASK_MINUTE * 5);
+
   debugln(bootBlock.bootCount);
 
   bootBlock.bootCount++;
@@ -787,6 +798,7 @@ void loop()
 
   if (bootBlock.bootMode == 1)
   {
+
     taskS.execute(); // Execute scheduled tasks
                      // events();     // Call the events function to handle any events that have occurred
     // irMenu(pControl[cBlock.programMode].irMenuLevel); // Handle the IR menu system, pass in the current menu level from the control block
@@ -1936,12 +1948,12 @@ void programAstroData()
     if (isMoonVisable())
     {
       canvas.fillRect(64, 0, 128, 32, BLACK); // Fill the right side with a night color rectangle
-      displayImage(moonfile, 80, 0);          // Display the moon image on the matrix
+      displayBmpImage(moonfile, 80, 0);          // Display the moon image on the matrix
     }
     else
     {
       canvas.fillRect(64, 32, 128, 64, BLACK); // Fill the right side with a night color rectangle
-      displayImage(moonfile, 80, 32);          // Display a default moon image if the moon is not visible
+      displayBmpImage(moonfile, 80, 32);          // Display a default moon image if the moon is not visible
     }
 
     // Clear the screen
@@ -2039,7 +2051,7 @@ bool readAstroData()
   return true;
 } // End readAstroData()
 
-void displayImage(const char *filename, s16_t xloc, s16_t yloc)
+void displayBmpImage(const char *filename, s16_t xloc, s16_t yloc)
 {
   u8_t tempcolor[3]; // Temporary color buffer for RGB values
 
@@ -2059,23 +2071,23 @@ void displayImage(const char *filename, s16_t xloc, s16_t yloc)
   // Read image data
   file.seek(54); // BMP header size
   uint16_t rowSize = (ImageWidth * 3 + 3) & ~3;
-  u8_t *displayImageBuffer = (u8_t *)malloc(rowSize);
+  u8_t *displayBmpImageBuffer = (u8_t *)malloc(rowSize);
 
   for (int16_t y = ImageHeight - 1; y >= 0; y--)
   {
-    file.read(displayImageBuffer, rowSize);
+    file.read(displayBmpImageBuffer, rowSize);
     for (int16_t x = 0; x < ImageWidth; x++)
     {
-      tempcolor[2] = displayImageBuffer[x * 3];                                                                     // Blue
-      tempcolor[1] = displayImageBuffer[x * 3 + 1];                                                                 // Green
-      tempcolor[0] = displayImageBuffer[x * 3 + 2];                                                                 // Red
+      tempcolor[2] = displayBmpImageBuffer[x * 3];                                                                     // Blue
+      tempcolor[1] = displayBmpImageBuffer[x * 3 + 1];                                                                 // Green
+      tempcolor[0] = displayBmpImageBuffer[x * 3 + 2];                                                                 // Red
       videoBufferC[(y + yloc) * MatrixWidth + (x + xloc)] = RGB24To565(tempcolor, cBlock.matrixBrightness / 255.0); // Set the pixel color in the buffer
       // matrix.drawPixel(x + xloc, y + yloc, AdjRGB_565(tempcolor, CBlock.MatrixBrightness / 255.0));
     }
   }
   file.close();
-  free(displayImageBuffer);
-} // End displayImage()
+  free(displayBmpImageBuffer);
+} // End displayBmpImage()
 
 bool setupAstro()
 {
@@ -2753,10 +2765,14 @@ bool checkAstro()
 void taskTimeExe()
 {
   // Execute time-related tasks
+  if (ntpAlive)
+    updateNTP();
+
   if (cBlock.gnssActive && gBlock.alive)
   {
     // Execute time-related tasks here
-    readGNSS();
+    readGNSS(5);
+    return;
   }
 }
 
@@ -2769,4 +2785,10 @@ bool taskTmpExe()
 {
   // Execute temperature-related tasks
   return true;
+}
+
+void taskBME280Exe()
+{
+  if (bmeData.alive)
+    readBME280();
 }
