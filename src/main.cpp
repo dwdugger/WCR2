@@ -14,7 +14,7 @@
 //  The code uses various libraries for functionality such as WiFi management, weather data retrieval, and display control.
 //  The code is written in C++ and is intended to run on an ESP32-S3 microcontroller using the Arduino framework.
 //  Varios assumptions are made RTC < NTP < GNSS for time sources, and BME280 is used for
-//  temperature, humidity, and pressure data.
+//  temperature, humidity, and` q11 pressure data.
 //  The code also includes functionality for over-the-air updates, IR remote control, and more.
 //  The code is still in development and may contain bugs or incomplete features, but it serves as a starting point
 //  for the WunderClock project.
@@ -150,13 +150,13 @@ bool readBlocks(void);
 void setupPControl(void);
 bool bootBlockRead(void);
 bool bootBlockWrite(void);
-bool readBME280(void);
+bool readBME280Data(void);
 bool setupWiFi(void);
-bool readGNSS(u8_t wait = 30);
+bool readGNSSData(u8_t wait = 30);
 bool readGoogleTZAPI(void);
 void setupColors(float factor);               // Function to adjust color brightness
 u16_t RGB24To565(u8_t *tmpRGB, float factor); // Function to convert 24-bit RGB to 16-bit RGB565 with brightness factor
-void displayBmpImage(const char *filename, s16_t xloc = 0, s16_t yloc = 0);
+void displayBmpImageCanvas(const char *filename, s16_t xloc = 0, s16_t yloc = 0);
 
 bool readAstroData(void);
 bool readMoonPhase(time_t time);
@@ -177,7 +177,6 @@ void irMenu00(void);
 void irMenu01(void);
 
 void taskTimeExe();   // Function to execute time-related tasks
-void taskAstroExe();  // Function to execute astronomical data-related tasks
 void taskBME280Exe(); // Function to execute BME280 sensor-related tasks
 bool taskTmpExe();    // Function to execute temperature-related tasks
 
@@ -266,7 +265,7 @@ struct WCcontrol // Control struct for WunderClock
   u8_t programMode = 1;                                         // Mode for loop() 1=Clock,2=Weather,3=Astro,4=GNSS,5=Startup,6=System,7=Video,8=Tester,9=Reset,0=setup
   char timeZoneId[17] = "America/Denver";                       // Timezone name for ezTime
   s32_t rawOffset = -25200;                                     // Offset in seconds from UTC, default is -25200 for Mountain Standard Time
-  s32_t dstOffset = 3600;                                       // Daylight Saving Time offset in seconds, default is 3600 for Mountain Daylight Time
+  s32_t dstOffset = 0;                                          // Daylight Saving Time offset in seconds, /3600 for hours
   double latitude = 43.837;                                     // Latitude in degrees
   double longitude = -103.624;                                  // Longitude in degrees
   double elevation = 1982;                                      // Elevation in meters
@@ -330,6 +329,7 @@ struct weatherData // Weather data struct
   float windBearing = 0;     // Wind direction in degrees
   float windGust = 0;        // Wind gust speed
   float pop = 0;             // Probability of precipitation
+  float aqi = 0;              // Air Quality Index
   bool current = false;      // Indicates if the weather data is alive
   time_t owocLastUpdate = 0; // Timestamp of the last weather update
   /*
@@ -480,8 +480,7 @@ u16_t *videoBufferC = canvas.getBuffer();
 
 // Task tShowMatrix(TASK_SECOND, TASK_FOREVER, &showMatrixTask); // Task to show the matrix display
 // Task tShowMatrix(1000, TASK_FOREVER, &showMatrixTask); // Task to show the matrix display
-Task taskTime(TASK_HOUR * 2, TASK_FOREVER, &taskTimeExe);       // Task for handling time-related operations
-Task taskAstro(TASK_HOUR * 24, TASK_FOREVER, &taskAstroExe);    // Task for handling astronomical data
+Task taskTime(TASK_MINUTE * 30, TASK_FOREVER, &taskTimeExe);    // Task for handling time-related operations
 Task taskBME280(TASK_MINUTE * 5, TASK_FOREVER, &taskBME280Exe); // Task for handling BME280 sensor data
 
 /*****************************************************************************
@@ -494,9 +493,7 @@ void setup()
   ESPFreeSketchSpace = ESP.getFreeSketchSpace(); // Free sketch space in bytes
 
   taskS.addTask(taskTime);
-  taskS.addTask(taskAstro);
   taskS.addTask(taskBME280);
-  debugln("Tasks added");
 
 #ifdef DEBUG1
   // Initialize Serial port
@@ -513,6 +510,10 @@ void setup()
 
   debugln("\nSerial is ready");
 #endif
+
+  debugln("Tasks added");
+  debugln("ESP Sketch Size: " + String(ESPSketchSize));
+  debugln("ESP Free Sketch Space: " + String(ESPFreeSketchSpace));
 
   // put your setup code here, to run once:
   if (!blindSetup()) // setup rtc, display, FRAM and littleFS file system
@@ -612,7 +613,7 @@ void setup()
     }
     if (gBlock.alive)
     {
-      if (readGNSS())
+      if (readGNSSData())
       {
         gBlock.current = true;
       }
@@ -659,7 +660,7 @@ void setup()
 
   if (WiFi.status() == WL_CONNECTED && googleTZAPIAlive && gBlock.alive)
   {
-    readGNSS(3); // Read the latest GNSS data before setting the time
+    readGNSSData(3); // Read the latest GNSS data before setting the time
 
     if (gnss.getDateValid() && gnss.getTimeValid())
     {
@@ -678,7 +679,7 @@ void setup()
     }
     if (bmeData.alive)
     {
-      readBME280(); // Read the latest BME280 sensor data
+      readBME280Data(); // Read the latest BME280 sensor data
     }
   }
 
@@ -772,8 +773,6 @@ void setup()
   debug("Size of astroDataBlock: ");
   debugln(sizeof(astroDataBlock));
 
-  debugln(TASK_MINUTE * 5);
-
   debugln(bootBlock.bootCount);
 
   bootBlock.bootCount++;
@@ -810,15 +809,15 @@ void loop()
       wm.autoConnect(); // Attempt to reconnect to WiFi if it is not connected
     }
 
-    if (myTZ.hour() == 0 && myTZ.minute() >= 1 && myTZ.isAM())
+    if (myTZ.hour() == 0 && myTZ.minute() == 1 && astroDataBlock.alive)
     {
-      taskAstro.enableIfNot();
+      readAstroData(); // Read the astronomical data at the start of the day
     }
 
     // Check Local Time to see if it is housekeeping time
     if (!HouseKeeping)
     {
-      if (myTZ.hour() == 3 && myTZ.minute() == 15 && myTZ.isAM()) // 3:15 AM local time
+      if (myTZ.hour() == 3 && myTZ.minute() == 15) // 3:15 AM local time
       {
         debugln("Housekeeping time, do something here");
         writeBlocks(); // Update the data block in the FRAM with the new values
@@ -1101,7 +1100,7 @@ bool setupGNSS()
   return true; // Return true if setup is successful
 } // end setupGNSS()
 
-bool readGNSS(u8_t wait)
+bool readGNSSData(u8_t wait)
 {
   // Read GNSS data
   u32_t end = millis() + (wait * 1000);
@@ -1128,13 +1127,14 @@ bool readGNSS(u8_t wait)
       debugln("gnss date & time valid");
       if (fabs(gBlock.latitude - cBlock.latitude) >= 0.1 || fabs(gBlock.longitude - cBlock.longitude) >= 0.1)
       {
-        matrixErrorPrint("Latitude or Longitude deviation exceeds threshold");
+        debugln("Location change detected, rebooting...");
+        matrixErrorPrint("Loc change reboot");
         cBlock.latitude = gBlock.latitude;
         cBlock.longitude = gBlock.longitude;
         cBlock.elevation = gBlock.elevation;
         writeBlocks();
-        while (1)
-          ;
+        delay(5000); // Pause for 5 seconds before reboot
+        ESP.restart();
       }
       else
       {
@@ -1169,7 +1169,7 @@ bool readGNSS(u8_t wait)
   }
   debugln("GNSS read failed after timeout");
   return false; // Return false if read failed after timeout
-} // end readGNSS()
+} // end readGNSSData()
 
 bool setupWiFi()
 {
@@ -1261,6 +1261,9 @@ bool readGoogleTZAPI()
 
   client.stop(); // Stop the HTTP client
   http.end();    // End the HTTP client
+
+  googleTZAPICurrent = true;
+  googleTZAPILastUpdate = myTZ.now();
 
   return true;
 
@@ -1657,7 +1660,7 @@ void irMenu01()
   return;
 } // end irMenu01()
 
-bool readBME280()
+bool readBME280Data()
 {
   // Add code to read data from BME280 sensor
   bmeData.temp_C = bme.readTemperature();
@@ -1689,7 +1692,7 @@ bool readBME280()
   debugln(" %");
 
   return true; // Return true if read is successful
-} // end readBME280()
+} // end readBME280Data()
 
 bool readMoonPhase(time_t time)
 {
@@ -1948,12 +1951,12 @@ void programAstroData()
     if (isMoonVisable())
     {
       canvas.fillRect(64, 0, 128, 32, BLACK); // Fill the right side with a night color rectangle
-      displayBmpImage(moonfile, 80, 0);          // Display the moon image on the matrix
+      displayBmpImageCanvas(moonfile, 80, 0); // Display the moon image on the matrix
     }
     else
     {
       canvas.fillRect(64, 32, 128, 64, BLACK); // Fill the right side with a night color rectangle
-      displayBmpImage(moonfile, 80, 32);          // Display a default moon image if the moon is not visible
+      displayBmpImageCanvas(moonfile, 80, 32); // Display a default moon image if the moon is not visible
     }
 
     // Clear the screen
@@ -2004,6 +2007,41 @@ void programAstroData()
 void programTester()
 {
   // Add code to program the tester display
+
+  u8_t progMode = cBlock.programMode;                            // Set the program mode to the system status menuu
+  u8_t *subprogA = &(pControl[progMode].subProgram);             // Get the submenu number for the system status menu
+  u8_t subprogV = pControl[progMode].subProgram;                 // Get the submenu number value for the system status menu
+  bool *progactiveA = &(pControl[progMode].programActive);       // Get the program active status for the system status menu
+  bool *subprogactiveA = &(pControl[progMode].subProgramActive); // Get the submenu status for the system status menu
+  u8_t subprogtotal = pControl[progMode].subProgramTotal;        // Get the total number of submenus for the system status menu
+  u8_t *irmenulevelA = &(pControl[progMode].irMenuLevel);        // Get the IR menu level for the system status menu
+
+  *irmenulevelA = 1;
+  // irLoop();
+  irMenu(*irmenulevelA); // Call the IR menu function to handle IR commands for the system status menu
+
+  switch (*subprogA)
+  {
+  case 0:
+    // Add code for submenu 0
+    matrix.fillScreen(BLUE); // Clear the matrix display before printing new content
+    matrix.setFont(&Aclonica_Regular_12);
+    matrix.setTextColor(MYYELLOW1);
+    matrix.setCursor(0, 8);                                                                  // Set the cursor to the bottom-left corner of the font
+    matrix.println("Tester submenu 0");                                                      // Display a message for submenu 0
+    *subprogactiveA = true;                                                                  // Set the submenu active flag to true for submenu 0
+    *progactiveA = true;                                                                     // Set the program active flag to true for submenu 0
+    matrix.println(dateTime(gBlock.gnssLastUpdate, "H:i:s"));                                // Display the current time on the matrix display
+    matrix.println(dateTime(gBlock.gnssLastUpdate, "Y-m-d"));                                // Display the current date on the matrix display
+    matrix.println(dateTime(DateTime(year(), month(), day(), 0, 0, 0).unixtime(), "Y-m-d")); // Display the current date on the matrix display
+    matrix.show();                                                                           // show the matrix display to show the changes
+    break;
+  case 1:
+    // Add code for submenu 1
+    break;
+  default:
+    break;
+  }
 }
 
 bool isMoonVisable()
@@ -2028,6 +2066,8 @@ bool readAstroData()
 {
   double myAstroTMP;
 
+  debugln("Reading astro data...");
+
   myAstro.doMoon();                                                                               // Calculate the moon position
   myAstro.doMoonRiseSetTimes();                                                                   // Calculate the moon rise and set times
   myAstroTMP = myAstro.getMoonriseTime() * 3600.0;                                                // Calculate the moon rise time in seconds
@@ -2038,11 +2078,9 @@ bool readAstroData()
   myAstro.doSun();             // Calculate the sun position
   myAstro.doSunRiseSetTimes(); // Calculate the sun rise and set times
   myAstroTMP = myAstro.getSunriseTime() * 3600.0;
-  debugln(myAstroTMP);                                                                           // Calculate the sun rise time
   astroDataBlock.sunRiseTime = DateTime(year(), month(), day(), 0, 0, 0) + TimeSpan(myAstroTMP); // Set the sun rise time to the current date
-  myAstroTMP = myAstro.getSunsetTime() * 3600.0;
-  debugln(myAstroTMP);                                                                          // Calculate the sun set time
-  astroDataBlock.sunSetTime = DateTime(year(), month(), day(), 0, 0, 0) + TimeSpan(myAstroTMP); // Set the sun set time to the current date
+  myAstroTMP = myAstro.getSunsetTime() * 3600.0;                                                 // Calculate the sun set time
+  astroDataBlock.sunSetTime = DateTime(year(), month(), day(), 0, 0, 0) + TimeSpan(myAstroTMP);  // Set the sun set time to the current date
 
   // Get the moon phase
   readMoonPhase(UTC.now());
@@ -2051,7 +2089,7 @@ bool readAstroData()
   return true;
 } // End readAstroData()
 
-void displayBmpImage(const char *filename, s16_t xloc, s16_t yloc)
+void displayBmpImageCanvas(const char *filename, s16_t xloc, s16_t yloc)
 {
   u8_t tempcolor[3]; // Temporary color buffer for RGB values
 
@@ -2078,16 +2116,16 @@ void displayBmpImage(const char *filename, s16_t xloc, s16_t yloc)
     file.read(displayBmpImageBuffer, rowSize);
     for (int16_t x = 0; x < ImageWidth; x++)
     {
-      tempcolor[2] = displayBmpImageBuffer[x * 3];                                                                     // Blue
-      tempcolor[1] = displayBmpImageBuffer[x * 3 + 1];                                                                 // Green
-      tempcolor[0] = displayBmpImageBuffer[x * 3 + 2];                                                                 // Red
+      tempcolor[2] = displayBmpImageBuffer[x * 3];                                                                  // Blue
+      tempcolor[1] = displayBmpImageBuffer[x * 3 + 1];                                                              // Green
+      tempcolor[0] = displayBmpImageBuffer[x * 3 + 2];                                                              // Red
       videoBufferC[(y + yloc) * MatrixWidth + (x + xloc)] = RGB24To565(tempcolor, cBlock.matrixBrightness / 255.0); // Set the pixel color in the buffer
       // matrix.drawPixel(x + xloc, y + yloc, AdjRGB_565(tempcolor, CBlock.MatrixBrightness / 255.0));
     }
   }
   file.close();
   free(displayBmpImageBuffer);
-} // End displayBmpImage()
+} // End displayBmpImageCanvas()
 
 bool setupAstro()
 {
@@ -2115,7 +2153,7 @@ bool setupAstro()
   {
     myAstro.setGMTdate(gBlock.year, gBlock.month, gBlock.day); // Set the date in GMT
     debugln("Setting GMT time from GNSS");
-    myAstro.setGMTtime(gBlock.hour, gBlock.minute, gBlock.second); // Set the time in GMT
+    myAstro.setGMTtime(UTC.hour(), UTC.minute(), UTC.second()); // Set the time in GMT
   }
 
   return true;
@@ -2508,7 +2546,7 @@ bool setupOWOC()
 
   //*************** LOCATION ************************
 
-  myTimeZone = doc["rawOffset"].as<int32_t>() / 3600; //<--------- GMT OFFSET in hours
+  myTimeZone = cBlock.rawOffset / 3600; //<--------- GMT OFFSET in hours
 
   // Location MODES are used to tell the program how you are delivering your coordinates:
   //  1 LAT/LON  <----- Can be from GPS, manual as below, or whatever method gets you a latitude and longitude except IP location
@@ -2621,12 +2659,6 @@ bool readOWOC()
     debugln(" inHg");
     debug(wBlock.mmHgPressure);
     debugln(" mmHg");
-
-    /*
-    debugln(String(wBlock.hPaPressure).length() + "hPa");
-    debugln(String(wBlock.inHgPressure).length() + "inHg");
-    debugln(String(wBlock.mmHgPressure).length() + "mmHg");
-    */
   }
   else
   {
@@ -2646,6 +2678,19 @@ bool readOWOC()
   }
   else
     debugln("FORECAST IS OFF or EMPTY");
+
+      if (owoc.quality) // Check if data is in the struct for all variables before using them
+  {
+    wBlock.aqi = owoc.quality->aqi;
+    debugln("aqi");
+    debugln(wBlock.aqi);
+   // Serial.printf("Carbon : % .2f\n", owoc.quality->co);
+   // Serial.printf("Nitrogen : % .2f\n", owoc.quality->no);
+   // Serial.printf("Ozone : % .2f\n", owoc.quality->o3);
+  }
+  else
+    Serial.printf("\nAIR QUALITY IS OFF or EMPTY\n");
+
 
   /*
   { // Check if data is in the struct for all variables before using them
@@ -2726,19 +2771,8 @@ bool readOWOC()
   else
     Serial.printf("\nOVERVIEW IS OFF or EMPTY\n");
 
-  if (owoc.quality) // Check if data is in the struct for all variables before using them
-  {
-    Serial.printf("\nAir Quality and Pollution Numbers for today");
-    Serial.printf("\nAir Quality : % d\n", owoc.quality->aqi);
-    Serial.printf("Carbon : % .2f\n", owoc.quality->co);
-    Serial.printf("Nitrogen : % .2f\n", owoc.quality->no);
-    Serial.printf("Ozone : % .2f\n", owoc.quality->o3);
-  }
-  else
-    Serial.printf("\nAIR QUALITY IS OFF or EMPTY\n");
 
-
-   */
+*/
 
   return true; // Return true if read is successful
 } // End readOWOCData()
@@ -2770,15 +2804,9 @@ void taskTimeExe()
 
   if (cBlock.gnssActive && gBlock.alive)
   {
-    // Execute time-related tasks here
-    readGNSS(5);
+    readGNSSData(5);
     return;
   }
-}
-
-void taskAstroExe()
-{
-  // Execute astronomical data-related tasks
 }
 
 bool taskTmpExe()
@@ -2790,5 +2818,5 @@ bool taskTmpExe()
 void taskBME280Exe()
 {
   if (bmeData.alive)
-    readBME280();
+    readBME280Data();
 }
